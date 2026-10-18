@@ -208,3 +208,15 @@ test("does not submit when CAPTCHA completion resets a declaration", async () =>
   expect(clicks).toEqual(["I agree"]);
   expect(options.submitting).not.toHaveBeenCalled();
 });
+
+test("selects all declarations in one batch and logs count", async () => {
+  const { driver, options, clicks } = fixture([
+    { url: path("Application/Submit.aspx"), button: "Submit", declarations: ["I agree", "I understand", "I confirm"] },
+    { url: path("Application/SubmitConfirmation.aspx?ApplicationId=" + applicationId), message: "Application submitted" },
+  ]);
+  const log = vi.spyOn(console, "log").mockImplementation(() => {});
+  await finishApplication(driver, options);
+  expect(clicks.slice(0, 3)).toEqual(["I agree", "I understand", "I confirm"]);
+  expect(log.mock.calls.some(call => /Declarations: selected 3\/3 Yes in one batch/.test(String(call[0])))).toBe(true);
+  log.mockRestore();
+});

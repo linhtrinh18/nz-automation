@@ -214,13 +214,38 @@ export async function finishApplication(
       // Declaration consent can enable an initially disabled Submit control.
       if (!page.button && !(page.stage === "declaration" && page.declarations.length)) break;
       visited.add(page.stage);
-      for (const declaration of page.declarations) {
+      if (page.stage === "declaration" && page.declarations.length) {
         await options.checkpoint();
-        // Re-check application identity before every declaration mutation.
         const current = await read();
         if (current.url !== page.url || current.stage !== "declaration" || current.blocked)
           return incomplete("Trang cam kết đã thay đổi. Chưa xác nhận nộp hồ sơ; kiểm tra Chrome.");
-        if (!(await declaration.isSelected())) await declaration.click();
+        // One synchronous script: real element.click() fires click/change events with bubbling.
+        const started = Date.now();
+        await driver.executeScript(String.raw`
+          for (const el of arguments) {
+            const input = el.control || el;
+            if (!input.checked) el.click();
+          }
+        `, ...page.declarations);
+        const left = (await read()).declarations;
+        const total = page.declarations.length;
+        console.log(`[NZWH] Declarations: selected ${total - left.length}/${total} Yes in one batch (${((Date.now() - started) / 1000).toFixed(1)}s).`);
+        // Fall back to sequential clicks for any that the batch missed.
+        for (const declaration of left) {
+          await options.checkpoint();
+          const again = await read();
+          if (again.url !== page.url || again.stage !== "declaration" || again.blocked)
+            return incomplete("Trang cam kết đã thay đổi. Chưa xác nhận nộp hồ sơ; kiểm tra Chrome.");
+          if (!(await declaration.isSelected())) await declaration.click();
+        }
+      } else {
+        for (const declaration of page.declarations) {
+          await options.checkpoint();
+          const current = await read();
+          if (current.url !== page.url || current.stage !== "declaration" || current.blocked)
+            return incomplete("Trang cam kết đã thay đổi. Chưa xác nhận nộp hồ sơ; kiểm tra Chrome.");
+          if (!(await declaration.isSelected())) await declaration.click();
+        }
       }
       if (page.stage === "declaration") {
         const verified = await read();
