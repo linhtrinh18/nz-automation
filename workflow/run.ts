@@ -242,10 +242,14 @@ export async function captchaGuard(driver: WebDriver): Promise<boolean> {
               balance: "Tài khoản hết số dư.",
               auth: "API key không hợp lệ hoặc bị khóa.",
               ip: "IP không được phép hoặc bị chặn.",
-              unsolvable: "Không giải được CAPTCHA (đã hoàn tiền).",
+              unsolvable: "Không giải được CAPTCHA.",
+              busy: "Dịch vụ đang quá tải; thử lại sau ít giây.",
+              proxy: "Proxy không dùng được.",
             };
-            const hint = reason in hints && "error" in resolved && resolved.error instanceof TwoCaptchaError ? ` ${hints[reason]}` : "";
-            await notify(`${providerName} không hoàn tất (${reason}).${hint} ${manual}`);
+            const twoCaptchaError = "error" in resolved && resolved.error instanceof TwoCaptchaError ? resolved.error : undefined;
+            const hint = twoCaptchaError && reason in hints ? ` ${hints[reason]}` : "";
+            const code = twoCaptchaError?.providerCode ? `, ${twoCaptchaError.providerCode}` : "";
+            await notify(`${providerName} không hoàn tất (${reason}${code}).${hint} ${manual}`);
           }
         }
         if (applied && challenge && Date.now() - applied.at >= 10000) {

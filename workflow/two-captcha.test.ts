@@ -107,6 +107,19 @@ test.each([[10, "balance"], [1, "auth"], [11, "ip"], [12, "unsolvable"], [2, "bu
     await expect(solveRecaptchaV2(challenge, key, signal())).rejects.toMatchObject({ category, message: `TwoCaptcha ${category}` });
   });
 
+test.each([[1, "ERROR_KEY_DOES_NOT_EXIST"], [55, "ERROR_ACCOUNT_SUSPENDED"], [10, "ERROR_ZERO_BALANCE"]])(
+  "exposes raw provider code for errorId %i without the key", async (errorId, errorCode) => {
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(response({ errorId, errorCode, errorDescription: key })));
+    const error = await solveRecaptchaV2(challenge, key, signal()).catch((e: unknown) => e);
+    expect(error).toMatchObject({ providerCode: errorCode });
+    expect(JSON.stringify(error) + String((error as Error).message)).not.toContain(key);
+  });
+
+test("drops malformed provider codes", async () => {
+  vi.stubGlobal("fetch", vi.fn().mockResolvedValue(response({ errorId: 1, errorCode: key })));
+  await expect(solveRecaptchaV2(challenge, key, signal())).rejects.toMatchObject({ providerCode: undefined });
+});
+
 test("retries getTaskResult on transient HTTP failure but not createTask", async () => {
   vi.useFakeTimers();
   const fetch = vi.fn().mockResolvedValueOnce(response({ errorId: 0, taskId: 1 }))

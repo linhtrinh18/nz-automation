@@ -34,10 +34,15 @@ function categoryFor(errorId: number): TwoCaptchaCategory {
   }
 }
 
+// Only well-formed spec codes (e.g. ERROR_KEY_DOES_NOT_EXIST) are kept; anything else is dropped.
+function safeProviderCode(code: string | undefined): string | undefined {
+  return code && /^ERROR_[A-Z0-9_]{1,60}$/.test(code) ? code : undefined;
+}
+
 export class TwoCaptchaError extends Error {
   /** True for HTTP/network failures (no provider verdict), safe to retry on polling only. */
   transient = false;
-  constructor(public readonly category: TwoCaptchaCategory) {
+  constructor(public readonly category: TwoCaptchaCategory, public readonly providerCode?: string) {
     // Never expose provider bodies, descriptions, URLs, tokens or request exceptions.
     super(`TwoCaptcha ${category}`);
   }
@@ -59,7 +64,7 @@ async function call(
   if (!response.ok) throw Object.assign(new TwoCaptchaError("service"), { transient: true });
   const parsed = responseSchema.safeParse(await response.json());
   if (!parsed.success) throw new TwoCaptchaError("response");
-  if (parsed.data.errorId !== 0) throw new TwoCaptchaError(categoryFor(parsed.data.errorId));
+  if (parsed.data.errorId !== 0) throw new TwoCaptchaError(categoryFor(parsed.data.errorId), safeProviderCode(parsed.data.errorCode));
   if (parsed.data.status === "failed") throw new TwoCaptchaError("service");
   return parsed.data;
 }
