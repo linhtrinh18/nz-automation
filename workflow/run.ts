@@ -33,6 +33,12 @@ import { loadTwoCaptchaKey } from "../server/cloud";
 import { solveRecaptchaV2, CapSolverError } from "./capsolver";
 import { readCaptchaChallenge, applyCaptchaToken, clearCaptchaToken, type CaptchaChallenge } from "./capsolver-browser";
 import { finishApplication, type ApplicationResult } from "./submission";
+import {
+  DEPENDENT_FIELD_TIMEOUT_MS, FAST_POLL_MS, MAX_FIELD_RESUMES, PAGE_POLL_MS, POSTBACK_WAIT_MS, READY_WAIT_MS,
+  REMOTE_TRIGGER_FN, SECTION_WAIT_MS, SELECT2_RESULTS_WAIT_MS, SUBMISSION_CHANGE_WAIT_MS,
+  addFilled, fastFillEnabled, fieldAvailable, fieldPresent, fillSegment, isDisplayedAtomSource, isNavigationError,
+  planSection, readFieldValues, readLoadGap, readTimeOrigin, type FillEntry,
+} from "./fast-fill";
 interface AutomationActionResult extends ApplicationResult {
   driver: WebDriver;
 }
@@ -301,6 +307,7 @@ export async function waitWithCaptcha<T>(
   driver: WebDriver,
   condition: () => Promise<T>,
   timeout: number,
+  pollMs = PAGE_POLL_MS,
 ): Promise<NonNullable<T>> {
   let deadline = Date.now() + timeout;
   while (true) {
@@ -310,17 +317,23 @@ export async function waitWithCaptcha<T>(
     if (value) return value as NonNullable<T>;
     if (Date.now() >= deadline)
       throw new webdriverError.TimeoutError("Page condition did not become ready.");
-    await new Promise(resolve => setTimeout(resolve, 200));
+    await new Promise(resolve => setTimeout(resolve, pollMs));
   }
 }
 
-async function ready(driver: WebDriver): Promise<void> {
+async function ready(driver: WebDriver, pollMs = PAGE_POLL_MS): Promise<void> {
   await waitWithCaptcha(driver,
     async () =>
       (await driver.executeScript<string>("return document.readyState")) ===
       "complete",
-    30000,
+    READY_WAIT_MS,
+    pollMs,
   );
+}
+
+/** Stop/cancel check for the fast-fill loops (captchaGuard keeps its own). */
+function checkCancelled(): void {
+  if (execution.getStore()?.signal?.aborted) throw new StopRequested();
 }
 
 function assertHost(url: string): void {
@@ -680,7 +693,7 @@ async function setField(
             By.css(".select2-drop-active .select2-result-label"),
           )
         ).length > 0,
-      5000,
+      SELECT2_RESULTS_WAIT_MS,
     );
     const choices = await driver.findElements(
       By.css(".select2-drop-active .select2-result-label"),
@@ -706,14 +719,15 @@ async function activateChrome(driver: WebDriver): Promise<void> {
   await chromium.sendDevToolsCommand("Page.bringToFront", {});
 }
 
-async function waitForSection(driver: WebDriver, name: string): Promise<void> {
+async function waitForSection(driver: WebDriver, name: string, fast = false): Promise<void> {
   const id = Object.values(steps[name].fields)[0].id;
+  const pollMs = fast ? FAST_POLL_MS : PAGE_POLL_MS;
   await activateChrome(driver);
-  await ready(driver);
+  await ready(driver, pollMs);
   await waitWithCaptcha(driver, async () => {
     await requireSession(driver);
     return (await driver.findElements(By.id(id))).length === 1;
-  }, 20000);
+  }, SECTION_WAIT_MS, pollMs);
 }
 
 async function remoteTrigger(
@@ -721,12 +735,7 @@ async function remoteTrigger(
   element: WebElement,
 ): Promise<boolean> {
   return driver.executeScript<boolean>(
-    `
-    const e = arguments[0], risk = /__doPostBack|WebForm_DoPostBack|\\.submit\\s*\\(|ajax|fetch\\s*\\(|XMLHttpRequest|sendBeacon/i;
-    const inline = Array.from(e.attributes).filter(a => a.name.startsWith('on')).map(a => a.value);
-    const bound = typeof jQuery === 'undefined' ? [] : Object.values(jQuery._data(e, 'events') || {}).flatMap(list => list.map(h => String(h.handler)));
-    return [...inline, ...bound].some(source => risk.test(source));
-  `,
+    `return (${REMOTE_TRIGGER_FN})(arguments[0]);`,
     element,
   );
 }
@@ -762,12 +771,12 @@ async function previousSavedReport(
   }
 }
 
-async function locateField(driver: WebDriver, id: string): Promise<WebElement> {
+async function locateField(driver: WebDriver, id: string, pollMs = PAGE_POLL_MS): Promise<WebElement> {
   const element = await waitWithCaptcha(driver, async () => {
     await requireSession(driver);
     const elements = await driver.findElements(By.id(id));
     return elements.length === 1 ? elements[0] : undefined;
-  }, 20000);
+  }, SECTION_WAIT_MS, pollMs);
   if (!element)
     throw new WorkingHolidayStop(
       "Expected form control did not become available.",
@@ -835,6 +844,7 @@ async function postbackAndWait(
   driver: WebDriver,
   trigger: WebElement,
   name: string,
+  fast = false,
 ): Promise<void> {
   const stamp = await driver.executeScript<number>(
     "return performance.timeOrigin",
@@ -844,7 +854,7 @@ async function postbackAndWait(
   await emit({ type: "persistence", state: "possible" });
   await trigger.sendKeys(Key.SPACE);
   try {
-    await waitForPostback(driver, name, stamp);
+    await waitForPostback(driver, name, stamp, fast);
   } catch (error) {
     if (error instanceof Error && error.name === "TimeoutError")
       throw new SectionPostbackTimeoutError(name);
@@ -856,6 +866,7 @@ async function waitForPostback(
   driver: WebDriver,
   name: string,
   stamp: number,
+  fast = false,
 ): Promise<void> {
   await waitWithCaptcha(driver, async () => {
     await requireSession(driver);
@@ -867,8 +878,10 @@ async function waitForPostback(
       Object.values(steps[name].fields)[0].id,
       stamp,
     );
-  }, 30000);
-  await waitForSection(driver, name);
+  }, POSTBACK_WAIT_MS, fast ? FAST_POLL_MS : PAGE_POLL_MS);
+  // The predicate already proved a new complete document with the first field present.
+  if (fast) await activateChrome(driver);
+  else await waitForSection(driver, name);
 }
 
 const selectionMatches = (label: string, expected: string): boolean =>
@@ -1091,62 +1104,235 @@ async function sectionSaveControl(
   return tab;
 }
 
+/** Today's per-field entry: locate, check availability, type/select, read back. */
+async function legacyFillField(
+  driver: WebDriver,
+  name: string,
+  key: string,
+  field: FieldDefinition,
+  data: ApplicationData,
+  report: SavedSection,
+  fast: boolean,
+): Promise<void> {
+  await requireSession(driver);
+  if (
+    name === "adviser" &&
+    key === "exemptionReason" &&
+    !applicable(data, name, key)
+  )
+    return;
+  if (field.lookup) return; // Search/result workflow below owns these transient inputs.
+  const sourceValue = data[name as SectionName][key];
+  const expected = expectedFieldValue(name, key, sourceValue);
+  if (expected !== sourceValue)
+    console.log(`[NZWH] ${name}.${key}: prepared for website persistence (colons removed; source document unchanged).`);
+  const pollMs = fast ? FAST_POLL_MS : PAGE_POLL_MS;
+  let element = await locateField(driver, field.id, pollMs);
+  if (
+    !(await element.isEnabled()) ||
+    (field.kind !== "select" && !(await element.isDisplayed()))
+  ) {
+    if (applicable(data, name, key) && expected)
+      throw new WorkingHolidayStop(
+        `Required conditional field unavailable: ${name}.${key}.`,
+      );
+    return;
+  }
+  if (!applicable(data, name, key) && expected) return;
+  const posts = await remoteTrigger(driver, element);
+  const current = await element.getAttribute("value");
+  const stamp = posts
+    ? await driver.executeScript<number>("return performance.timeOrigin")
+    : 0;
+  if (posts && current !== expected)
+    await emit({ type: "persistence", state: "possible" });
+  await setField(driver, field, expected, element);
+  // Reselect matching values too. Same-value selections may not emit change,
+  // so only require a postback when the underlying value actually changes.
+  if (posts && current !== expected) {
+    await waitForPostback(driver, name, stamp, fast);
+    element = await locateField(driver, field.id, pollMs);
+  }
+  if (
+    (await driver.executeScript<string>(
+      "return arguments[0].value",
+      element,
+    )) !== expected
+  )
+    throw new WorkingHolidayStop(`Readback mismatch: ${name}.${key}.`);
+  addFilled(report, key);
+  console.log(`[NZWH] ${name}.${key}: entered and read back.`);
+}
+
+/** Counts and durations only; never values. */
+interface FillStats {
+  fast: number;
+  unchanged: number;
+  standard: number;
+  skipped: number;
+  segments: number;
+  standardMs: number;
+}
+
+async function unexpectedReload(): Promise<never> {
+  await emit({ type: "persistence", state: "possible" });
+  throw new WorkingHolidayStop("Form reloaded unexpectedly while filling; stopped before SAVE.");
+}
+
+/** Batched entry: one script per segment; posting/unusual fields use the standard entry. */
+async function fastFillSection(
+  driver: WebDriver,
+  name: SectionName,
+  data: ApplicationData,
+  report: SavedSection,
+  atom: string,
+): Promise<FillStats> {
+  const stats: FillStats = { fast: 0, unchanged: 0, standard: 0, skipped: 0, segments: 0, standardMs: 0 };
+  const entries = planSection(name, data);
+  const byKey = new Map(entries.map((entry) => [entry.key, entry]));
+  let stamp = await readTimeOrigin(driver);
+  const waitFor = async (condition: () => Promise<boolean>, timeout: number, message: string) => {
+    try {
+      await waitWithCaptcha(driver, async () => {
+        checkCancelled();
+        await requireSession(driver);
+        return condition();
+      }, timeout, FAST_POLL_MS);
+    } catch (error) {
+      if (error instanceof webdriverError.TimeoutError) throw new WorkingHolidayStop(message);
+      throw error;
+    }
+    if ((await readTimeOrigin(driver)) !== stamp) await unexpectedReload();
+  };
+  const runFill = async () => {
+    report.filled = [];
+    const resumes = new Map<string, number>();
+    const resume = (entry: FillEntry, message: string) => {
+      const count = (resumes.get(entry.key) ?? 0) + 1;
+      resumes.set(entry.key, count);
+      if (count > MAX_FIELD_RESUMES) throw new WorkingHolidayStop(message);
+    };
+    let index = 0;
+    while (index < entries.length) {
+      checkCancelled();
+      await captchaGuard(driver);
+      await requireSession(driver);
+      let out;
+      try {
+        out = await fillSegment(driver, atom, entries, index);
+      } catch (error) {
+        if (isNavigationError(error)) await unexpectedReload();
+        throw error;
+      }
+      stats.segments++;
+      if (out.timeOrigin !== stamp) await unexpectedReload();
+      for (const result of out.results) {
+        const entry = byKey.get(result.key)!;
+        if (result.status === "filled" || result.status === "unchanged") {
+          if (result.status === "filled") stats.fast++;
+          else stats.unchanged++;
+          addFilled(report, entry.key);
+          if (entry.colonsPrepared)
+            console.log(`[NZWH] ${name}.${entry.key}: prepared for website persistence (colons removed; source document unchanged).`);
+          console.log(`[NZWH] ${name}.${entry.key}: entered and read back.`);
+        } else stats.skipped++;
+      }
+      if (!out.stop) break;
+      const i = out.stop.index;
+      const entry = entries[i];
+      switch (out.stop.reason) {
+        case "yield":
+          index = i;
+          break;
+        case "missing": {
+          const message = "Expected form control did not become available.";
+          resume(entry, message);
+          await waitFor(() => fieldPresent(driver, entry.id), SECTION_WAIT_MS, message);
+          index = i;
+          break;
+        }
+        case "unavailable-required": {
+          const message = `Required conditional field unavailable: ${name}.${entry.key}.`;
+          resume(entry, message);
+          await waitFor(() => fieldAvailable(driver, atom, entry.id, entry.kind), DEPENDENT_FIELD_TIMEOUT_MS, message);
+          index = i;
+          break;
+        }
+        case "posting":
+        case "fallback": {
+          if (out.stop.reason === "fallback")
+            console.log(`[NZWH] ${name}.${entry.key}: fast entry not accepted (${out.stop.cause}); using standard entry.`);
+          const started = Date.now();
+          await legacyFillField(driver, name, entry.key, steps[name].fields[entry.key], data, report, true);
+          stats.standardMs += Date.now() - started;
+          stats.standard++;
+          stamp = await readTimeOrigin(driver);
+          index = i + 1;
+          break;
+        }
+      }
+    }
+  };
+  // Pre-SAVE re-check: a later handler or postback must not have altered an earlier field.
+  const recheck = async (): Promise<string | null> => {
+    const read = await readFieldValues(driver, report.filled.map((key) => byKey.get(key)!.id));
+    if (read.timeOrigin !== stamp) await unexpectedReload();
+    for (const [position, key] of report.filled.entries()) {
+      const value = read.values[position];
+      if (value === null) throw new WorkingHolidayStop("Expected form control did not become available.");
+      if (value !== byKey.get(key)!.expected) return key;
+    }
+    return null;
+  };
+  await runFill();
+  if (await recheck()) {
+    await runFill();
+    const mismatch = await recheck();
+    if (mismatch) throw new WorkingHolidayStop(`Readback mismatch: ${name}.${mismatch}.`);
+  }
+  return stats;
+}
+
+/** Test only: run one section save with a fake or fixture driver. */
+export const saveStepForTest = (driver: WebDriver, name: string, data: ApplicationData, fast = false) => saveStep(driver, name, data, fast);
+
+/** Kill-switch snapshot, read once per run (NZWH_FAST_FILL=0 restores standard entry). */
+function fastEntrySnapshot(): boolean {
+  if (!fastFillEnabled()) {
+    console.log("[NZWH] Fast entry disabled (NZWH_FAST_FILL).");
+    return false;
+  }
+  if (isDisplayedAtomSource() === null) {
+    console.log("[NZWH] Fast entry unavailable; using standard entry.");
+    return false;
+  }
+  console.log("[NZWH] Fast entry enabled.");
+  return true;
+}
+
+const gapText = (gap: number | null) => (gap === null ? "n/a" : String(gap));
+
 async function saveStep(
   driver: WebDriver,
   name: string,
   data: ApplicationData,
+  fast = false,
 ): Promise<SavedSection> {
   const report: SavedSection = { filled: [], persisted: [], lookups: [] };
   const url = await driver.getCurrentUrl();
-  for (const [key, field] of Object.entries(steps[name].fields)) {
-    await requireSession(driver);
-    if (
-      name === "adviser" &&
-      key === "exemptionReason" &&
-      !applicable(data, name, key)
-    )
-      continue;
-    if (field.lookup) continue; // Search/result workflow below owns these transient inputs.
-    const sourceValue = data[name as SectionName][key];
-    const expected = expectedFieldValue(name, key, sourceValue);
-    if (expected !== sourceValue)
-      console.log(`[NZWH] ${name}.${key}: prepared for website persistence (colons removed; source document unchanged).`);
-    let element = await locateField(driver, field.id);
-    if (
-      !(await element.isEnabled()) ||
-      (field.kind !== "select" && !(await element.isDisplayed()))
-    ) {
-      if (applicable(data, name, key) && expected)
-        throw new WorkingHolidayStop(
-          `Required conditional field unavailable: ${name}.${key}.`,
-        );
-      continue;
+  const pageGap = await readLoadGap(driver);
+  const fillStarted = Date.now();
+  let stats: FillStats = { fast: 0, unchanged: 0, standard: 0, skipped: 0, segments: 0, standardMs: 0 };
+  const atom = fast ? isDisplayedAtomSource() : null;
+  if (atom) stats = await fastFillSection(driver, name as SectionName, data, report, atom);
+  else
+    for (const [key, field] of Object.entries(steps[name].fields)) {
+      const started = Date.now();
+      await legacyFillField(driver, name, key, field, data, report, false);
+      stats.standardMs += Date.now() - started;
+      stats.standard++;
     }
-    if (!applicable(data, name, key) && expected) continue;
-    const posts = await remoteTrigger(driver, element);
-    const current = await element.getAttribute("value");
-    const stamp = posts
-      ? await driver.executeScript<number>("return performance.timeOrigin")
-      : 0;
-    if (posts && current !== expected)
-      await emit({ type: "persistence", state: "possible" });
-    await setField(driver, field, expected, element);
-    // Reselect matching values too. Same-value selections may not emit change,
-    // so only require a postback when the underlying value actually changes.
-    if (posts && current !== expected) {
-      await waitForPostback(driver, name, stamp);
-      element = await locateField(driver, field.id);
-    }
-    if (
-      (await driver.executeScript<string>(
-        "return arguments[0].value",
-        element,
-      )) !== expected
-    )
-      throw new WorkingHolidayStop(`Readback mismatch: ${name}.${key}.`);
-    report.filled.push(key);
-    console.log(`[NZWH] ${name}.${key}: entered and read back.`);
-  }
+  const fillMs = Date.now() - fillStarted;
   if (name === "occupation")
     report.lookups = await occupationSelection(driver, data);
   const unmapped = await driver.executeScript<string[]>(
@@ -1168,7 +1354,9 @@ async function saveStep(
   if ((await driver.getCurrentUrl()) !== url)
     throw new WorkingHolidayStop("Unexpected navigation before SAVE.");
   const save = await sectionSaveControl(driver, name);
-  await postbackAndWait(driver, save, name);
+  const saveStarted = Date.now();
+  await postbackAndWait(driver, save, name, fast);
+  const saveGap = await readLoadGap(driver);
   if (new URL(await driver.getCurrentUrl()).pathname !== new URL(url).pathname)
     throw new WorkingHolidayStop(
       "SAVE navigated outside the inspected section; stopped.",
@@ -1180,21 +1368,35 @@ async function saveStep(
     throw new WorkingHolidayStop(
       `Server validation flagged ${invalid} fields in ${name}; stopped before next section.`,
     );
+  const saveMs = Date.now() - saveStarted;
   await emit({ type: "persistence", state: "accepted" });
+  const verifyStarted = Date.now();
   await navigate(driver, url);
-  await waitForSection(driver, name);
+  await waitForSection(driver, name, fast);
+  const reloadGap = await readLoadGap(driver);
   const reloaded = new URL(await driver.getCurrentUrl());
   const original = new URL(url);
   if (reloaded.origin !== original.origin || reloaded.pathname !== original.pathname ||
       reloaded.searchParams.get("ApplicationId") !== original.searchParams.get("ApplicationId"))
     throw new WorkingHolidayStop("Unexpected application after SAVE reload.");
   const mismatches: string[] = [];
-  for (const key of report.filled.filter(
+  const verifyKeys = report.filled.filter(
     (key) => !steps[name].fields[key].lookup,
-  )) {
-    const element = await driver.findElement(By.id(steps[name].fields[key].id));
+  );
+  // Fast mode reads every saved value in one script instead of two round trips per field.
+  const batched = atom
+    ? (await readFieldValues(driver, verifyKeys.map((key) => steps[name].fields[key].id))).values
+    : null;
+  for (const [position, key] of verifyKeys.entries()) {
     const expected = expectedFieldValue(name, key, data[name as SectionName][key]);
-    const actual = await element.getAttribute("value");
+    let actual: string | null;
+    if (batched) {
+      actual = batched[position];
+      if (actual === null) throw new webdriverError.NoSuchElementError("Saved field missing after reload.");
+    } else {
+      const element = await driver.findElement(By.id(steps[name].fields[key].id));
+      actual = await element.getAttribute("value");
+    }
     if (actual !== expected) {
       mismatches.push(`${name}.${key}`);
       console.log(`[NZWH] Saved-value mismatch ${name}.${key}: ${savedValueDiagnostic(expected, actual)}; section=${steps[name].page}. No applicant values logged.`);
@@ -1211,6 +1413,10 @@ async function saveStep(
   if (mismatches.length)
     throw new SavedValueVerificationError(mismatches, report.persisted.length);
   await emit({ type: "persistence", state: "verified" });
+  const verifyMs = Date.now() - verifyStarted;
+  console.log(
+    `[NZWH] ${name}: timing fill ${fillMs}ms (fast ${stats.fast}, unchanged ${stats.unchanged}, standard ${stats.standard} in ${stats.standardMs}ms, skipped ${stats.skipped}, segments ${stats.segments}), save ${saveMs}ms, verify ${verifyMs}ms; load gap page ${gapText(pageGap)}/save ${gapText(saveGap)}/reload ${gapText(reloadGap)}ms.`,
+  );
   console.log(
     `[NZWH] ${name}: SAVE completed; ${report.persisted.length} values persisted and verified. Continuing in the same tab.`,
   );
@@ -1259,8 +1465,9 @@ export async function fillAndSaveWorkingHolidaySection(
     );
   await driver.manage().window().maximize();
   await requireSession(driver);
-  await waitForSection(driver, options.section);
-  const report = await saveStep(driver, options.section, data);
+  const fast = fastEntrySnapshot();
+  await waitForSection(driver, options.section, fast);
+  const report = await saveStep(driver, options.section, data, fast);
   const saved = await previousSavedReport(true);
   saved[options.section] = report;
   await writeFile(
@@ -1286,6 +1493,7 @@ async function executeWorkingHoliday(
   const mode = z.enum(["loginOnly", "saveAll", "fillAndSubmit"]).parse(options.mode ?? "saveAll");
   const data = mode === "loginOnly" ? base : scenarioData(base, scenario);
   if (mode !== "loginOnly") validateData(data);
+  const fast = mode !== "loginOnly" && fastEntrySnapshot();
   if (mode !== "loginOnly" && base.dataKind === "fictional" && !options.allowFictionalDraftSave)
     throw new WorkingHolidayStop(
       "Saving fictional values in the existing live draft requires explicit --allow-fictional-draft-save opt-in.",
@@ -1463,7 +1671,7 @@ async function executeWorkingHoliday(
           const url = `${origin}/WorkingHoliday/Wizard/${steps[name].page}?${applicationPage?.searchParams.toString()}`;
           if ((await driver.getCurrentUrl()) !== url)
             await navigate(driver, url);
-          await waitForSection(driver, name);
+          await waitForSection(driver, name, fast);
           const actual = new URL(await driver.getCurrentUrl());
           assertHost(actual.href);
           if (
@@ -1474,7 +1682,7 @@ async function executeWorkingHoliday(
             throw new WorkingHolidayStop(
               "Conditional page unavailable or application changed.",
             );
-          saved[name] = await saveStep(driver, name, data);
+          saved[name] = await saveStep(driver, name, data, fast);
           completedSections.push(name);
           await writeFile(
             join(reportDirectory, "coverage-saved.json"),
@@ -1631,7 +1839,7 @@ async function executeWorkingHoliday(
     },
     waitForCaptcha: async () => { await captchaGuard(driver); },
     // Check the transition before entering the next page's CAPTCHA wait.
-    waitForChange: condition => driver.wait(condition, 30000),
+    waitForChange: condition => driver.wait(condition, SUBMISSION_CHANGE_WAIT_MS),
     submitting: () => emit({ type: "submission", state: "unconfirmed" }),
     confirmed: () => emit({ type: "submission", state: "confirmed" }),
   });
