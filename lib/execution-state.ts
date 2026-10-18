@@ -40,6 +40,9 @@ export const outcomeSchema = z.object({
   detail: z.string().default(""),
   checked: z.number().default(0),
   blocked: z.number().default(0),
+  startedAt: z.string().optional(),
+  finishedAt: z.string().optional(),
+  durationMs: z.number().nonnegative().optional(),
 });
 export type Outcome = z.infer<typeof outcomeSchema>;
 export const jobSchema = z.object({
@@ -100,6 +103,14 @@ export function allowedControl(
         ? activeStatus(status)
         : activeStatus(status) && status !== "stop_requested";
 }
+function withTiming<T extends { startedAt?: string }>(item: T) {
+  if (!item.startedAt) return {};
+  const finishedAt = new Date().toISOString();
+  return {
+    finishedAt,
+    durationMs: Math.max(0, Date.parse(finishedAt) - Date.parse(item.startedAt)),
+  };
+}
 export function interruptJob(job: Job, message: string): Job {
   return {
     ...job,
@@ -112,6 +123,7 @@ export function interruptJob(job: Job, message: string): Job {
       ["running", "waiting_captcha"].includes(item.status)
         ? {
             ...item,
+            ...withTiming(item),
             status:
               item.persistence === "accepted"
                 ? "saved_unverified"
@@ -135,6 +147,7 @@ export function stopJob(job: Job, message: string): Job {
       ["running", "waiting_captcha"].includes(item.status)
         ? {
             ...item,
+            ...withTiming(item),
             status: "stopped" as const,
             detail:
               "Đã dừng theo yêu cầu. Chưa xác minh việc lưu; không tự gửi lại.",

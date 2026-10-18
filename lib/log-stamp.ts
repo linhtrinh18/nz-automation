@@ -8,6 +8,11 @@ export function registerLogSecret(secret: string): void {
   if (secret) registeredSecrets.add(secret);
 }
 
+export const QUIET_TOKEN = "[NZWH:q]";
+/** Marks a routine INFO line to print without a timestamp stamp (milestones stay stamped). */
+export function quiet(message: string): string {
+  return `${QUIET_TOKEN} ${message}`;
+}
 /** Prefixes every console line with ISO time, elapsed since boot and level; secrets are masked. */
 export function installLogStamping(
   bootMs: number,
@@ -16,6 +21,10 @@ export function installLogStamping(
   const wrap = (level: "INFO" | "WARN" | "ERROR", write: (text: string) => void) =>
     (...args: unknown[]) => {
       const text = redactSecrets(format(...args), [...secrets(), ...registeredSecrets], true);
+      if (level === "INFO" && text.includes(QUIET_TOKEN)) {
+        for (const line of text.split("\n")) write(`  ${line.replace(QUIET_TOKEN + " ", "")}`);
+        return;
+      }
       const stamp = `${new Date().toISOString()} +${formatDuration(Date.now() - bootMs)} ${level}`;
       for (const line of text.split("\n")) write(`${stamp} ${line}`);
     };

@@ -61,6 +61,7 @@ export class ExecutionController implements ExecutionHooks {
       if (!item || item.status !== "pending")
         throw new Error("Phạm vi thực thi không khớp kế hoạch đã xác nhận.");
       item.status = "running";
+      item.startedAt = new Date().toISOString();
       this.job.phase = "section";
       this.job.message = "Đang xử lý mục hồ sơ đã chọn.";
     } else if (event.type === "persistence" && current) {
@@ -94,6 +95,13 @@ export class ExecutionController implements ExecutionHooks {
       current.detail = event.detail;
       current.checked = event.checked ?? 0;
       current.blocked = event.blocked ?? 0;
+      if (current.startedAt) {
+        current.finishedAt = new Date().toISOString();
+        current.durationMs = Math.max(
+          0,
+          Date.parse(current.finishedAt) - Date.parse(current.startedAt),
+        );
+      }
     }
     await this.persist();
   }

@@ -67,8 +67,15 @@ const execution = new AsyncLocalStorage<{
   signal?: AbortSignal;
   credentials?: { username: string; password: string };
 }>();
+let runStartMs = Date.now();
+let sectionMark: { name: string; startMs: number } | undefined;
 async function emit(event: ExecutionEvent): Promise<void> {
   const context = execution.getStore();
+  if (event.type === "section-start") sectionMark = { name: event.section, startMs: Date.now() };
+  else if (event.type === "section-result" && sectionMark) {
+    console.log(`[NZWH] Section ${sectionMark.name} ${event.status} in ${formatDuration(Date.now() - sectionMark.startMs)}.`);
+    sectionMark = undefined;
+  }
   if (context && event.type === "persistence" && event.state !== "verified")
     context.risk = true;
   await context?.hooks?.event(event);
@@ -824,7 +831,7 @@ async function lookupClickAndWait(
       await requireSession(driver);
       if (Date.now() - beat >= 10000) {
         beat = Date.now();
-        console.log(`${tag} Đang chờ trang phản hồi… ${Math.round((beat - started) / 1000)}s/${Math.round(timeout / 1000)}s`);
+        console.log(`[NZWH:q] ${tag} Đang chờ trang phản hồi… ${Math.round((beat - started) / 1000)}s/${Math.round(timeout / 1000)}s`);
       }
       try {
         return await condition();
@@ -919,7 +926,7 @@ async function waitForResults(
       await requireSession(driver);
       if (Date.now() - beat >= 10000) {
         beat = Date.now();
-        console.log(`${tag} Đang chờ trang phản hồi… ${Math.round((beat - started) / 1000)}s/${Math.round(timeout / 1000)}s`);
+        console.log(`[NZWH:q] ${tag} Đang chờ trang phản hồi… ${Math.round((beat - started) / 1000)}s/${Math.round(timeout / 1000)}s`);
       }
       try {
         const idle = await pageIdle(driver);
@@ -1125,7 +1132,7 @@ async function legacyFillField(
   const sourceValue = data[name as SectionName][key];
   const expected = expectedFieldValue(name, key, sourceValue);
   if (expected !== sourceValue)
-    console.log(`[NZWH] ${name}.${key}: prepared for website persistence (colons removed; source document unchanged).`);
+    console.log(`[NZWH:q] [NZWH] ${name}.${key}: prepared for website persistence (colons removed; source document unchanged).`);
   const pollMs = fast ? FAST_POLL_MS : PAGE_POLL_MS;
   let element = await locateField(driver, field.id, pollMs);
   if (
@@ -1161,7 +1168,7 @@ async function legacyFillField(
   )
     throw new WorkingHolidayStop(`Readback mismatch: ${name}.${key}.`);
   addFilled(report, key);
-  console.log(`[NZWH] ${name}.${key}: entered and read back.`);
+  console.log(`[NZWH:q] [NZWH] ${name}.${key}: entered and read back.`);
 }
 
 /** Counts and durations only; never values. */
@@ -1233,8 +1240,8 @@ async function fastFillSection(
           else stats.unchanged++;
           addFilled(report, entry.key);
           if (entry.colonsPrepared)
-            console.log(`[NZWH] ${name}.${entry.key}: prepared for website persistence (colons removed; source document unchanged).`);
-          console.log(`[NZWH] ${name}.${entry.key}: entered and read back.`);
+            console.log(`[NZWH:q] [NZWH] ${name}.${entry.key}: prepared for website persistence (colons removed; source document unchanged).`);
+          console.log(`[NZWH:q] [NZWH] ${name}.${entry.key}: entered and read back.`);
         } else stats.skipped++;
       }
       if (!out.stop) break;
@@ -1440,6 +1447,7 @@ export async function fillAndSaveWorkingHolidaySection(
     console.log("[NZWH] Occupation is excluded: no filling, lookup, SAVE or verification.");
     return;
   }
+  runStartMs = Date.now();
   const base = dataSchema.parse(
     JSON.parse(await readFile(options.dataPath, "utf8")),
   );
@@ -1844,6 +1852,7 @@ async function executeWorkingHoliday(
     confirmed: () => emit({ type: "submission", state: "confirmed" }),
   });
   console.log(`[NZWH] ${result.message}`);
+  console.log(`[NZWH] Run finished; total ${formatDuration(Date.now() - runStartMs)}.`);
   return {
     ...result,
     driver,
