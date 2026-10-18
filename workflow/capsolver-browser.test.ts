@@ -4,7 +4,7 @@ import type { WebDriver } from "selenium-webdriver";
 import { readCaptchaChallenge, applyCaptchaToken, clearCaptchaToken } from "./capsolver-browser";
 const origin = "https://onlineservices.immigration.govt.nz";
 const sitekey = "public-site-key-1234567890";
-function fixture(options: { host?: string; path?: string; src?: string; count?: number; token?: string; unsupported?: boolean; sameForm?: boolean; action?: string; pageId?: number; buttons?: number; buttonAction?: string } = {}) {
+function fixture(options: { host?: string; path?: string; src?: string; count?: number; token?: string; unsupported?: boolean; sameForm?: boolean; action?: string; pageId?: number; buttons?: number; buttonAction?: string; search?: string } = {}) {
   const frame = { src: options.src ?? `https://www.google.com/recaptcha/api2/anchor?k=${sitekey}&size=normal`, getBoundingClientRect: () => ({ width: 304, height: 78 }) };
   const button = { value: "Submit", disabled: false, getBoundingClientRect: frame.getBoundingClientRect, getAttribute: () => options.buttonAction ?? null };
   const form = { contains: () => options.sameForm !== false, getAttribute: () => options.action ?? "/rs-captcha", querySelectorAll: () => Array(options.buttons ?? 1).fill(button) };
@@ -12,8 +12,8 @@ function fixture(options: { host?: string; path?: string; src?: string; count?: 
   const host = options.host ?? origin;
   const path = options.path ?? "/rs-captcha";
   const driver = { executeScript: async (script: string, ...args: unknown[]) => runInNewContext(`(() => {${script}})()`, {
-    arguments: args, URL, Event, performance: { timeOrigin: options.pageId ?? 123 },
-    location: { origin: host, pathname: path, href: `${host}${path}?redirect=private-application-id#private-fragment` },
+    arguments: args, URL, URLSearchParams, Event, performance: { timeOrigin: options.pageId ?? 123 },
+    location: { origin: host, pathname: path, search: options.search ?? "?redirect=private-application-id", href: `${host}${path}?redirect=private-application-id#private-fragment` },
     document: {
       querySelector: () => options.unsupported ? {} : null,
       querySelectorAll: (selector: string) => selector === "iframe" ? Array(options.count ?? 1).fill(frame) : [response],
@@ -62,4 +62,29 @@ test("ignores a late result after navigation, widget change or human completion"
     expect(await applyCaptchaToken(driver, origin, expected, "provider-token")).toBeFalsy();
     expect(response.value).not.toBe("provider-token");
   }
+});
+
+// Minimal fixture: the real Submit.aspx DOM was NOT verified (standard visible checkbox + SUBMIT assumed).
+const submit = { path: "/WorkingHoliday/Application/Submit.aspx", search: "?ApplicationId=4085718", action: "/WorkingHoliday/Application/Submit.aspx" };
+test("Submit.aspx: keeps the query string in websiteURL and applies/clears the token", async () => {
+  const { driver, response } = fixture(submit);
+  const challenge = (await readCaptchaChallenge(driver, origin))!;
+  expect(JSON.parse(JSON.stringify(challenge))).toEqual({ websiteURL: origin + submit.path + submit.search, websiteKey: sitekey, pageId: 123 });
+  await expect(applyCaptchaToken(driver, origin, challenge, "provider-token")).resolves.toBe(true);
+  expect(response.value).toBe("provider-token");
+  await clearCaptchaToken(driver, origin, challenge, "provider-token");
+  expect(response.value).toBe("");
+});
+test("Submit.aspx: ignores a late result after the query string changes", async () => {
+  const expected = (await readCaptchaChallenge(fixture(submit).driver, origin))!;
+  const { driver, response } = fixture({ ...submit, search: "?ApplicationId=999" });
+  expect(await applyCaptchaToken(driver, origin, expected, "provider-token")).toBeFalsy();
+  expect(response.value).toBe("");
+});
+test.each([
+  { search: "" }, { search: "?Token=abc" }, { path: "/WorkingHoliday/Application/Declarations.aspx", action: "/WorkingHoliday/Application/Declarations.aspx" },
+  { action: "/WorkingHoliday/Wizard/Personal1.aspx" }, { buttonAction: "/WorkingHoliday/Wizard/Personal1.aspx" },
+  { count: 0 }, { count: 2 }, { token: "human-token" }, { buttons: 2 }, { unsupported: true }, { host: "https://foreign.invalid" },
+])("Submit.aspx: falls back to manual for unsupported variants: %j", async options => {
+  await expect(readCaptchaChallenge(fixture({ ...submit, ...options }).driver, origin)).resolves.toBeNull();
 });

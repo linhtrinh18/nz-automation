@@ -28,7 +28,7 @@ import { applicable } from "./conditions";
 import { expectedFieldValue, savedValueDiagnostic } from "./saved-values";
 import { classifyPage, type PageState } from "./page-state";
 import { loadCapSolverKey } from "../server/cloud";
-import { solveRecaptchaV2 as solveTwoCaptcha, TwoCaptchaError } from "./two-captcha";
+import { solveRecaptchaV2 as solveTwoCaptcha, TwoCaptchaError, formatDuration } from "./two-captcha";
 import { loadTwoCaptchaKey } from "../server/cloud";
 import { solveRecaptchaV2, CapSolverError } from "./capsolver";
 import { readCaptchaChallenge, applyCaptchaToken, clearCaptchaToken, type CaptchaChallenge } from "./capsolver-browser";
@@ -161,12 +161,14 @@ export async function captchaGuard(driver: WebDriver): Promise<boolean> {
     await emit({ type: "captcha", waiting: true, message });
     console.log(`[NZWH] ${message}`);
   };
+  const captchaStartedAt = Date.now();
+  const since = () => formatDuration(Date.now() - captchaStartedAt);
+  const trace = (message: string) => console.log(`[NZWH] CAPTCHA +${since()}: ${message}`);
   const providerName = context?.captchaMode === "2captcha" ? "2Captcha" : "CapSolver";
   const manual = "Giải CAPTCHA trong Chrome; tác vụ tự tiếp tục. Chỉ nút Submit riêng của CAPTCHA được tự bấm khi có phản hồi.";
   if (typeof (driver as Driver).sendDevToolsCommand === "function")
     await activateChrome(driver).catch(() => undefined);
   const submitted = new Set<string>();
-  const captchaStartedAt = Date.now();
   const attempt = new AbortController();
   const signal = context?.signal ? AbortSignal.any([attempt.signal, context.signal]) : attempt.signal;
   let result: { token: string } | { error: unknown } | undefined;
@@ -174,10 +176,12 @@ export async function captchaGuard(driver: WebDriver): Promise<boolean> {
   let challenge: CaptchaChallenge | null = null;
   let applied: { token: string; at: number } | undefined;
   let completed = false;
+  let solvedAt: number | undefined;
   try {
     if (context?.captchaMode === "capsolver" || context?.captchaMode === "2captcha") {
       challenge = await readCaptchaChallenge(driver, origin);
       checkCancelled();
+      trace(`mode=${context.captchaMode}; page=${await driver.getCurrentUrl().then(u => new URL(u).pathname, () => "unknown")}; challenge ${challenge ? "supported (reCAPTCHA v2)" : "unsupported (no usable reCAPTCHA v2 sitekey found)"}.`);
       let key: string | null = null;
       let configurationUnavailable = false;
       if (challenge) {
@@ -189,11 +193,12 @@ export async function captchaGuard(driver: WebDriver): Promise<boolean> {
           configurationUnavailable = true;
         }
         checkCancelled();
+        trace(configurationUnavailable ? "key load failed; manual fallback." : `key loaded from app: ${key ? `yes (length ${key.length})` : "no"}.`);
       }
       if (key && challenge) {
         await notify(`Đang thử ${providerName} (reCAPTCHA v2). Bạn vẫn có thể giải trong Chrome; lỗi sẽ chuyển sang thủ công.`);
-        pending = (context.captchaMode === "2captcha" ? solveTwoCaptcha : solveRecaptchaV2)({ websiteURL: challenge.websiteURL, websiteKey: challenge.websiteKey }, key, signal)
-          .then(token => { result = { token }; }, error => { result = { error }; });
+        pending = (context.captchaMode === "2captcha" ? solveTwoCaptcha : solveRecaptchaV2)({ websiteURL: challenge.websiteURL, websiteKey: challenge.websiteKey }, key, signal, trace)
+          .then(token => { result = { token }; solvedAt = Date.now(); trace(`${providerName} ready; token length ${token.length}.`); }, error => { result = { error }; });
       } else {
         await notify(`${!challenge ? "Chưa hỗ trợ cấu hình CAPTCHA này." : configurationUnavailable ? `Không đọc được cấu hình ${providerName}; nhờ quản trị viên kiểm tra.` : context.captchaMode === "2captcha" ? "Chưa có khóa 2Captcha dùng chung; nhờ quản trị viên cấu hình trong /admin/2captcha." : "Chưa có khóa CapSolver dùng chung; nhờ quản trị viên cấu hình trong /admin."} ${manual}`);
       }
@@ -212,6 +217,7 @@ export async function captchaGuard(driver: WebDriver): Promise<boolean> {
             checkCancelled();
             await candidate.button.click();
             console.log("[NZWH] CAPTCHA-only Submit clicked; waiting for acceptance.");
+            trace("CAPTCHA-only Submit clicked; waiting for page acceptance.");
           } catch (error) {
             if (!(error instanceof webdriverError.StaleElementReferenceError) &&
                 !(error instanceof webdriverError.NoSuchElementError)) throw error;
@@ -230,9 +236,11 @@ export async function captchaGuard(driver: WebDriver): Promise<boolean> {
             const accepted = await applyCaptchaToken(driver, origin, challenge, resolved.token);
             if (accepted) {
               applied = { token: resolved.token, at: Date.now() };
+              trace(`token injected (length ${resolved.token.length}); waiting for page acceptance.`);
               await notify(`Đã nhận phản hồi ${providerName}; đang chờ trang đích xác nhận CAPTCHA.`);
             } else {
               attempt.abort();
+              trace("page or challenge changed; token discarded; manual fallback.");
               await notify(`Trang hoặc CAPTCHA đã thay đổi; bỏ phản hồi ${providerName}. ${manual}`);
             }
           } else {
@@ -249,12 +257,14 @@ export async function captchaGuard(driver: WebDriver): Promise<boolean> {
             const twoCaptchaError = "error" in resolved && resolved.error instanceof TwoCaptchaError ? resolved.error : undefined;
             const hint = twoCaptchaError && reason in hints ? ` ${hints[reason]}` : "";
             const code = twoCaptchaError?.providerCode ? `, ${twoCaptchaError.providerCode}` : "";
+            trace(`${providerName} failed: category=${reason}${twoCaptchaError?.providerCode ? ` providerCode=${twoCaptchaError.providerCode}` : ""}; manual fallback.`);
             await notify(`${providerName} không hoàn tất (${reason}${code}).${hint} ${manual}`);
           }
         }
         if (applied && challenge && Date.now() - applied.at >= 10000) {
           await clearCaptchaToken(driver, origin, challenge, applied.token);
           applied = undefined;
+          trace("page did not accept the token within 10s; token cleared; manual fallback.");
           await notify(`Trang chưa chấp nhận phản hồi ${providerName}; không tự thử lại. Tải lại trang CAPTCHA nếu ô vẫn được chọn. ${manual}`);
         }
         return false;
@@ -276,6 +286,9 @@ export async function captchaGuard(driver: WebDriver): Promise<boolean> {
       ...(!completed ? { message: "Đã kết thúc chờ CAPTCHA; chưa xác nhận hoàn tất." } : {}),
     });
   }
+  if (solvedAt && applied) {
+    trace(`summary: solved by ${providerName} in ${formatDuration(solvedAt - captchaStartedAt)}, accepted ${formatDuration(Date.now() - applied.at)} after injection, total ${since()}.`);
+  } else trace(`summary: completed manually/without provider token, total ${since()}.`);
   console.log(
     `[NZWH] CAPTCHA completion detected after ${Math.round((Date.now() - captchaStartedAt) / 1000)}s. Resuming automatically.`,
   );

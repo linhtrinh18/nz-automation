@@ -48,6 +48,11 @@ export class TwoCaptchaError extends Error {
   }
 }
 
+/** Seconds with one decimal under 10s, whole seconds otherwise (e.g. "0.4s", "72s"). */
+export function formatDuration(ms: number): string {
+  const seconds = Math.max(0, ms) / 1000;
+  return seconds < 10 ? `${seconds.toFixed(1)}s` : `${Math.round(seconds)}s`;
+}
 async function call(
   method: "createTask" | "getTaskResult" | "getBalance",
   apiKey: string,
@@ -89,6 +94,7 @@ export async function solveRecaptchaV2(
   challenge: { websiteURL: string; websiteKey: string },
   apiKey: string,
   signal: AbortSignal,
+  log: (message: string) => void = () => undefined,
 ): Promise<string> {
   signal.throwIfAborted();
   const deadline = AbortSignal.timeout(120000);
@@ -112,9 +118,18 @@ export async function solveRecaptchaV2(
     if (!value) throw new TwoCaptchaError("response");
     return value;
   }
-  const created = await request("createTask", {
-    task: { type: "RecaptchaV2TaskProxyless", ...challenge },
-  });
+  const createStart = Date.now();
+  log("2Captcha createTask sending.");
+  let created: Awaited<ReturnType<typeof request>>;
+  try {
+    created = await request("createTask", {
+      task: { type: "RecaptchaV2TaskProxyless", ...challenge },
+    });
+  } catch (error) {
+    log(`2Captcha createTask failed after ${formatDuration(Date.now() - createStart)}.`);
+    throw error;
+  }
+  log(`2Captcha createTask sent in ${formatDuration(Date.now() - createStart)}; taskId=${created.taskId ?? "none"}.`);
   if (created.status === "ready") return token(created);
   if (!created.taskId) throw new TwoCaptchaError("response");
   // Official getTaskResult guidance requires at least 5 seconds between polls.
@@ -131,6 +146,7 @@ export async function solveRecaptchaV2(
         catch { if (signal.aborted) throw signal.reason; throw new TwoCaptchaError("timeout"); }
       }
     }
+    log(`2Captcha poll ${poll + 1}/24: ${result.status ?? "unknown"}; ${formatDuration(Date.now() - createStart)} since createTask.`);
     if (result.status === "ready") return token(result);
     if (result.status !== "idle" && result.status !== "processing")
       throw new TwoCaptchaError("response");

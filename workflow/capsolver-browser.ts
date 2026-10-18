@@ -11,7 +11,12 @@ export interface CaptchaChallenge {
 const inspect = `
   const capsolverChallenge = true;
   const captchaPath = path => /\\/(?:[a-z0-9_-]*captcha[a-z0-9_-]*)(?:\\.(?:aspx|html?))?$/i.test(path);
-  if (location.origin !== arguments[0] || !captchaPath(location.pathname)) return null;
+  // Submit.aspx (final page, real DOM NOT verified): only the standard checkbox widget with an ApplicationId.
+  // Its SUBMIT is the gated final submission; callbacks stay declined (manual fallback).
+  const submitPath = '/WorkingHoliday/Application/Submit.aspx';
+  const isSubmitPage = location.pathname === submitPath && new URLSearchParams(location.search).has('ApplicationId');
+  const allowedPath = path => captchaPath(path) || (isSubmitPage && path === submitPath);
+  if (location.origin !== arguments[0] || !(captchaPath(location.pathname) || isSubmitPage)) return null;
   const visible = e => e.getBoundingClientRect().width > 0 && e.getBoundingClientRect().height > 0;
   if (document.querySelector('script[src*="/recaptcha/enterprise"],iframe[src*="hcaptcha"],.h-captcha,.cf-turnstile,[data-callback],[data-s],[data-action],[data-size="invisible"]')) return null;
   const frames = Array.from(document.querySelectorAll('iframe')).filter(e => {
@@ -33,13 +38,13 @@ const inspect = `
   const form = response.form;
   if (!form || !form.contains(frame)) return null;
   const destination = new URL(form.getAttribute('action') || location.href, location.href);
-  if (destination.origin !== location.origin || !captchaPath(destination.pathname)) return null;
+  if (destination.origin !== location.origin || !allowedPath(destination.pathname)) return null;
   const buttons = Array.from(form.querySelectorAll('input[type="submit"],button[type="submit"],button:not([type])'))
     .filter(e => !e.disabled && visible(e) && /^submit$/i.test((e.value || e.textContent || '').trim()));
   if (buttons.length !== 1) return null;
   const target = new URL(buttons[0].getAttribute('formaction') || destination.href, location.href);
-  if (target.origin !== location.origin || !captchaPath(target.pathname)) return null;
-  const challenge = { websiteURL: location.origin + location.pathname, websiteKey: key, pageId: performance.timeOrigin };
+  if (target.origin !== location.origin || !allowedPath(target.pathname)) return null;
+  const challenge = { websiteURL: location.origin + location.pathname + (isSubmitPage ? location.search : ''), websiteKey: key, pageId: performance.timeOrigin };
 `;
 
 export async function readCaptchaChallenge(driver: WebDriver, origin: string): Promise<CaptchaChallenge | null> {
@@ -62,7 +67,7 @@ export async function applyCaptchaToken(driver: WebDriver, origin: string, expec
 export async function clearCaptchaToken(driver: WebDriver, origin: string, expected: CaptchaChallenge, token: string): Promise<void> {
   await driver.executeScript(`
     if (location.origin !== arguments[0] || performance.timeOrigin !== arguments[1].pageId
-      || location.origin + location.pathname !== arguments[1].websiteURL) return;
+      || location.origin + location.pathname + (location.pathname === '/WorkingHoliday/Application/Submit.aspx' ? location.search : '') !== arguments[1].websiteURL) return;
     for (const e of document.querySelectorAll('textarea[name="g-recaptcha-response"]')) {
       if (e.value === arguments[2]) e.value = '';
     }

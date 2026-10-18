@@ -139,3 +139,12 @@ test("getBalance posts clientKey and returns the balance", async () => {
   expect(fetch.mock.calls[0][0]).toBe("https://api.2captcha.com/getBalance");
   expect(JSON.parse(fetch.mock.calls[0][1].body)).toEqual({ clientKey: key });
 });
+
+import { formatDuration } from "./two-captcha";
+describe("formatDuration", () => {
+  it("formats sub-10s with one decimal and larger values as whole seconds", () => {
+    expect(formatDuration(400)).toBe("0.4s");
+    expect(formatDuration(72400)).toBe("72s");
+    expect(formatDuration(-5)).toBe("0.0s");
+  });
+});

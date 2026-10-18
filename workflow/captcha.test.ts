@@ -251,7 +251,10 @@ test.each(["missing-key", "database-failure", "unsupported", "service-failure", 
   const { promise, events } = automatic(fixture([true, true, true, false]).driver);
   await expect(promise).resolves.toBe(true);
   expect(solve).toHaveBeenCalledTimes(["missing-key", "database-failure", "unsupported"].includes(kind) ? 0 : 1);
-  if (kind === "unsupported") expect(key).not.toHaveBeenCalled();
+  if (kind === "unsupported") {
+    expect(key).not.toHaveBeenCalled();
+    expect(events.some(e => e.type === "captcha" && e.message === "Chưa hỗ trợ cấu hình CAPTCHA này. Giải CAPTCHA trong Chrome; tác vụ tự tiếp tục. Chỉ nút Submit riêng của CAPTCHA được tự bấm khi có phản hồi.")).toBe(true);
+  }
   expect(events.some(e => e.type === "captcha" && e.message?.includes("Giải CAPTCHA trong Chrome"))).toBe(true);
   expect(JSON.stringify(events)).not.toMatch(/server-secret|private-database-details|obsolete-key/);
 });
