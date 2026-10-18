@@ -29,6 +29,7 @@ import { expectedFieldValue, savedValueDiagnostic } from "./saved-values";
 import { classifyPage, type PageState } from "./page-state";
 import { loadCapSolverKey } from "../server/cloud";
 import { solveRecaptchaV2 as solveTwoCaptcha, TwoCaptchaError, formatDuration } from "./two-captcha";
+import { quiet } from "../lib/log-stamp";
 import { loadTwoCaptchaKey } from "../server/cloud";
 import { solveRecaptchaV2, CapSolverError } from "./capsolver";
 import { readCaptchaChallenge, applyCaptchaToken, clearCaptchaToken, type CaptchaChallenge } from "./capsolver-browser";
@@ -71,8 +72,10 @@ let runStartMs = Date.now();
 let sectionMark: { name: string; startMs: number } | undefined;
 async function emit(event: ExecutionEvent): Promise<void> {
   const context = execution.getStore();
-  if (event.type === "section-start") sectionMark = { name: event.section, startMs: Date.now() };
-  else if (event.type === "section-result" && sectionMark) {
+  if (event.type === "section-start") {
+    sectionMark = { name: event.section, startMs: Date.now() };
+    console.log(`[NZWH] Section ${event.section} started.`);
+  } else if (event.type === "section-result" && sectionMark) {
     console.log(`[NZWH] Section ${sectionMark.name} ${event.status} in ${formatDuration(Date.now() - sectionMark.startMs)}.`);
     sectionMark = undefined;
   }
@@ -831,7 +834,7 @@ async function lookupClickAndWait(
       await requireSession(driver);
       if (Date.now() - beat >= 10000) {
         beat = Date.now();
-        console.log(`[NZWH:q] ${tag} Đang chờ trang phản hồi… ${Math.round((beat - started) / 1000)}s/${Math.round(timeout / 1000)}s`);
+        console.log(quiet(`${tag} Đang chờ trang phản hồi… ${Math.round((beat - started) / 1000)}s/${Math.round(timeout / 1000)}s`));
       }
       try {
         return await condition();
@@ -926,7 +929,7 @@ async function waitForResults(
       await requireSession(driver);
       if (Date.now() - beat >= 10000) {
         beat = Date.now();
-        console.log(`[NZWH:q] ${tag} Đang chờ trang phản hồi… ${Math.round((beat - started) / 1000)}s/${Math.round(timeout / 1000)}s`);
+        console.log(quiet(`${tag} Đang chờ trang phản hồi… ${Math.round((beat - started) / 1000)}s/${Math.round(timeout / 1000)}s`));
       }
       try {
         const idle = await pageIdle(driver);
@@ -942,7 +945,7 @@ async function waitForResults(
     }, timeout)) as { id: string; label: string }[];
   } catch (error) {
     if (error instanceof Error && error.name === "TimeoutError") {
-      console.log(`${tag} Hết ${Math.round(timeout / 1000)}s mà trang vẫn chưa phản hồi; xem như 0 kết quả.`);
+      console.log(quiet(`${tag} Hết ${Math.round(timeout / 1000)}s mà trang vẫn chưa phản hồi; xem như 0 kết quả.`));
       return [];
     }
     throw error;
@@ -970,15 +973,15 @@ async function searchWithRetry(
   const started = Date.now();
   for (let attempt = 0; ; attempt++) {
     await typeQuery(driver, lookup, text);
-    console.log(`${tag} Tìm "${text}" (lần ${attempt + 1}/${backoff.length + 1}), chờ tối đa ${Math.round(timeout / 1000)}s.`);
+    console.log(quiet(`${tag} Tìm "${text}" (lần ${attempt + 1}/${backoff.length + 1}), chờ tối đa ${Math.round(timeout / 1000)}s.`));
     await clickWithFallback(driver, await locateField(driver, lookup.searchButtonId));
     const results = await waitForResults(driver, tag, lookup.resultButtonPrefix, timeout);
     const seconds = Math.round((Date.now() - started) / 1000);
     if (results.length > 0) {
-      console.log(`${tag} Đã tìm "${text}": ${results.length} kết quả sau ${seconds}s.`);
+      console.log(quiet(`${tag} Đã tìm "${text}": ${results.length} kết quả sau ${seconds}s.`));
       return results;
     }
-    console.log(`${tag} Đã tìm "${text}": 0 kết quả sau ${seconds}s.`);
+    console.log(quiet(`${tag} Đã tìm "${text}": 0 kết quả sau ${seconds}s.`));
     if (attempt >= backoff.length) return [];
     await sleep(backoff[attempt]);
   }
@@ -992,10 +995,10 @@ async function openFullList(driver: WebDriver, lookup: OccupationLookup, tag: st
     control,
   );
   if (links.length === 0) {
-    console.log(`${tag} Không thấy liên kết "full list" trên trang.`);
+    console.log(quiet(`${tag} Không thấy liên kết "full list" trên trang.`));
     return [];
   }
-  console.log(`${tag} Mở danh sách đầy đủ ("full list").`);
+  console.log(quiet(`${tag} Mở danh sách đầy đủ ("full list").`));
   await clickWithFallback(driver, links[0]);
   return waitForResults(driver, tag, lookup.resultButtonPrefix, timeout);
 }
@@ -1012,7 +1015,7 @@ async function occupationSelection(
     const existing = await driver.findElements(By.id(lookup.selectedLabelId));
     if (existing.length === 1 && selectionMatches(await existing[0].getText(), expected)) {
       selected.push(lookup.resultKey);
-      console.log(`${tag} Giá trị đã chọn khớp; bỏ qua bước tìm kiếm.`);
+      console.log(quiet(`${tag} Giá trị đã chọn khớp; bỏ qua bước tìm kiếm.`));
       continue;
     }
     const started = Date.now();
@@ -1027,7 +1030,7 @@ async function occupationSelection(
       total = Math.max(total, results.length);
       pick = pickResult(results.map((r) => r.label), expected);
       if (pick >= 0) break;
-      if (index < queries.length - 1) console.log(`${tag} Không có kết quả khớp "${expected}" cho "${text}"; thử cụm từ khác.`);
+      if (index < queries.length - 1) console.log(quiet(`${tag} Không có kết quả khớp "${expected}" cho "${text}"; thử cụm từ khác.`));
     }
     if (pick < 0) {
       results = await openFullList(driver, lookup, tag, timeout);
@@ -1037,10 +1040,10 @@ async function occupationSelection(
     }
     if (pick < 0) {
       const message = `Không tìm thấy "${expected}" sau khi tìm [${queries.join(", ")}] (${total} kết quả, ${Math.round((Date.now() - started) / 1000)}s). Kết quả quan sát: [${[...seen].slice(0, 20).map((l) => `"${l}"`).join(", ")}]. Hãy dùng đúng nhãn hiển thị trên trang.`;
-      console.log(`${tag} ${message}`);
+      console.log(quiet(`${tag} ${message}`));
       throw new WorkingHolidayStop(message);
     }
-    console.log(`${tag} Chọn kết quả "${results[pick].label}".`);
+    console.log(quiet(`${tag} Chọn kết quả "${results[pick].label}".`));
     await lookupClickAndWait(
       driver,
       await locateField(driver, results[pick].id),
@@ -1054,7 +1057,7 @@ async function occupationSelection(
     );
     await ready(driver);
     selected.push(lookup.resultKey);
-    console.log(`${tag} Đã chọn và xác minh "Selected Value" sau ${Math.round((Date.now() - started) / 1000)}s.`);
+    console.log(quiet(`${tag} Đã chọn và xác minh "Selected Value" sau ${Math.round((Date.now() - started) / 1000)}s.`));
   }
   return selected;
 }
@@ -1132,7 +1135,7 @@ async function legacyFillField(
   const sourceValue = data[name as SectionName][key];
   const expected = expectedFieldValue(name, key, sourceValue);
   if (expected !== sourceValue)
-    console.log(`[NZWH:q] [NZWH] ${name}.${key}: prepared for website persistence (colons removed; source document unchanged).`);
+    console.log(quiet(`[NZWH] ${name}.${key}: prepared for website persistence (colons removed; source document unchanged).`));
   const pollMs = fast ? FAST_POLL_MS : PAGE_POLL_MS;
   let element = await locateField(driver, field.id, pollMs);
   if (
@@ -1168,7 +1171,7 @@ async function legacyFillField(
   )
     throw new WorkingHolidayStop(`Readback mismatch: ${name}.${key}.`);
   addFilled(report, key);
-  console.log(`[NZWH:q] [NZWH] ${name}.${key}: entered and read back.`);
+  console.log(quiet(`[NZWH] ${name}.${key}: entered and read back.`));
 }
 
 /** Counts and durations only; never values. */
@@ -1240,8 +1243,8 @@ async function fastFillSection(
           else stats.unchanged++;
           addFilled(report, entry.key);
           if (entry.colonsPrepared)
-            console.log(`[NZWH:q] [NZWH] ${name}.${entry.key}: prepared for website persistence (colons removed; source document unchanged).`);
-          console.log(`[NZWH:q] [NZWH] ${name}.${entry.key}: entered and read back.`);
+            console.log(quiet(`[NZWH] ${name}.${entry.key}: prepared for website persistence (colons removed; source document unchanged).`));
+          console.log(quiet(`[NZWH] ${name}.${entry.key}: entered and read back.`));
         } else stats.skipped++;
       }
       if (!out.stop) break;
@@ -1306,14 +1309,14 @@ export const saveStepForTest = (driver: WebDriver, name: string, data: Applicati
 /** Kill-switch snapshot, read once per run (NZWH_FAST_FILL=0 restores standard entry). */
 function fastEntrySnapshot(): boolean {
   if (!fastFillEnabled()) {
-    console.log("[NZWH] Fast entry disabled (NZWH_FAST_FILL).");
+    console.log(quiet("[NZWH] Fast entry disabled (NZWH_FAST_FILL)."));
     return false;
   }
   if (isDisplayedAtomSource() === null) {
     console.log("[NZWH] Fast entry unavailable; using standard entry.");
     return false;
   }
-  console.log("[NZWH] Fast entry enabled.");
+  console.log(quiet("[NZWH] Fast entry enabled."));
   return true;
 }
 
@@ -1419,6 +1422,7 @@ async function saveStep(
   }
   if (mismatches.length)
     throw new SavedValueVerificationError(mismatches, report.persisted.length);
+  console.log(`[NZWH] ${name}: saved and verified after reload.`);
   await emit({ type: "persistence", state: "verified" });
   const verifyMs = Date.now() - verifyStarted;
   console.log(
@@ -1494,6 +1498,7 @@ export async function runWorkingHoliday(
 async function executeWorkingHoliday(
   options: WorkingHolidayOptions,
 ): Promise<AutomationActionResult> {
+  runStartMs = Date.now();
   const base = dataSchema.parse(
     JSON.parse(await readFile(options.dataPath, "utf8")),
   );
