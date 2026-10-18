@@ -1,5 +1,5 @@
 import { afterEach, expect, test, vi } from "vitest";
-import { getTwoCaptchaBalance, solveRecaptchaV2, TwoCaptchaError } from "./two-captcha";
+import { formatDuration, getTwoCaptchaBalance, solveRecaptchaV2, TwoCaptchaError } from "./two-captcha";
 
 // Vitest's fake clock does not replace node:timers/promises. Keep its abort
 // semantics while routing this module's waits through the controlled test clock.
@@ -91,13 +91,13 @@ test("cancellation interrupts polling without making another request", async () 
   expect(fetch).toHaveBeenCalledOnce();
 });
 
-test("processing ends within the 120-second attempt budget", async () => {
+test("processing ends within the 180-second attempt budget", async () => {
   vi.useFakeTimers();
   vi.stubGlobal("fetch", vi.fn().mockResolvedValueOnce(response({ errorId: 0, taskId: 12345 }))
     .mockImplementation(async () => response({ errorId: 0, status: "processing" })));
   const promise = solveRecaptchaV2(challenge, key, signal());
   const assertion = expect(promise).rejects.toThrow("TwoCaptcha timeout");
-  await vi.advanceTimersByTimeAsync(120000);
+  await vi.advanceTimersByTimeAsync(180000);
   await assertion;
 });
 
@@ -140,11 +140,25 @@ test("getBalance posts clientKey and returns the balance", async () => {
   expect(JSON.parse(fetch.mock.calls[0][1].body)).toEqual({ clientKey: key });
 });
 
-import { formatDuration } from "./two-captcha";
-describe("formatDuration", () => {
-  it("formats sub-10s with one decimal and larger values as whole seconds", () => {
-    expect(formatDuration(400)).toBe("0.4s");
-    expect(formatDuration(72400)).toBe("72s");
-    expect(formatDuration(-5)).toBe("0.0s");
-  });
+test("formatDuration uses one decimal under 10s and whole seconds above", () => {
+  expect(formatDuration(400)).toBe("0.4s");
+  expect(formatDuration(72400)).toBe("72s");
+  expect(formatDuration(-5)).toBe("0.0s");
+});
+
+test("keeps polling past 120 seconds and logs the extended budget and result", async () => {
+  vi.useFakeTimers();
+  const processing = Array.from({ length: 27 }, () => response({ errorId: 0, status: "processing" }));
+  const fetch = vi.fn().mockResolvedValueOnce(response({ errorId: 0, taskId: 12345 }));
+  for (const item of processing) fetch.mockResolvedValueOnce(item);
+  fetch.mockResolvedValueOnce(response({ errorId: 0, status: "ready", solution: { gRecaptchaResponse: "late-token" } }));
+  vi.stubGlobal("fetch", fetch);
+  const log = vi.fn();
+  const promise = solveRecaptchaV2(challenge, key, signal(), log);
+  await vi.advanceTimersByTimeAsync(145000);
+  await expect(promise).resolves.toBe("late-token");
+  const lines = log.mock.calls.map(c => String(c[0]));
+  expect(lines.some(l => l.includes("wait budget 180s"))).toBe(true);
+  expect(lines.some(l => l.includes("result received after"))).toBe(true);
+  expect(JSON.stringify(lines)).not.toContain(key);
 });

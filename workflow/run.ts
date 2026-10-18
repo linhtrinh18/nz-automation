@@ -181,7 +181,7 @@ export async function captchaGuard(driver: WebDriver): Promise<boolean> {
     if (context?.captchaMode === "capsolver" || context?.captchaMode === "2captcha") {
       challenge = await readCaptchaChallenge(driver, origin);
       checkCancelled();
-      trace(`mode=${context.captchaMode}; page=${await driver.getCurrentUrl().then(u => new URL(u).pathname, () => "unknown")}; challenge ${challenge ? "supported (reCAPTCHA v2)" : "unsupported (no usable reCAPTCHA v2 sitekey found)"}.`);
+      trace(`mode=${context.captchaMode}; page=${challenge ? new URL(challenge.websiteURL).pathname : "n/a"}; challenge ${challenge ? "supported (reCAPTCHA v2)" : "unsupported (no usable reCAPTCHA v2 sitekey found)"}.`);
       let key: string | null = null;
       let configurationUnavailable = false;
       if (challenge) {
@@ -197,7 +197,8 @@ export async function captchaGuard(driver: WebDriver): Promise<boolean> {
       }
       if (key && challenge) {
         await notify(`Đang thử ${providerName} (reCAPTCHA v2). Bạn vẫn có thể giải trong Chrome; lỗi sẽ chuyển sang thủ công.`);
-        pending = (context.captchaMode === "2captcha" ? solveTwoCaptcha : solveRecaptchaV2)({ websiteURL: challenge.websiteURL, websiteKey: challenge.websiteKey }, key, signal, trace)
+        const request = { websiteURL: challenge.websiteURL, websiteKey: challenge.websiteKey };
+        pending = (context.captchaMode === "2captcha" ? solveTwoCaptcha(request, key, signal, trace) : solveRecaptchaV2(request, key, signal))
           .then(token => { result = { token }; solvedAt = Date.now(); trace(`${providerName} ready; token length ${token.length}.`); }, error => { result = { error }; });
       } else {
         await notify(`${!challenge ? "Chưa hỗ trợ cấu hình CAPTCHA này." : configurationUnavailable ? `Không đọc được cấu hình ${providerName}; nhờ quản trị viên kiểm tra.` : context.captchaMode === "2captcha" ? "Chưa có khóa 2Captcha dùng chung; nhờ quản trị viên cấu hình trong /admin/2captcha." : "Chưa có khóa CapSolver dùng chung; nhờ quản trị viên cấu hình trong /admin."} ${manual}`);

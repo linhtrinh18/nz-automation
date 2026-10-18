@@ -89,6 +89,11 @@ export async function getTwoCaptchaBalance(apiKey: string, signal: AbortSignal):
   }
 }
 
+// 2Captcha worker time varies (78s seen earlier, >99s later); 120s cut off tasks still in progress.
+export const TWO_CAPTCHA_BUDGET_MS = 180000;
+const POLL_INTERVAL_MS = 5000;
+const MAX_POLLS = TWO_CAPTCHA_BUDGET_MS / POLL_INTERVAL_MS;
+
 /** One task, no create retries (a failed connection may already have incurred a charge). */
 export async function solveRecaptchaV2(
   challenge: { websiteURL: string; websiteKey: string },
@@ -97,7 +102,7 @@ export async function solveRecaptchaV2(
   log: (message: string) => void = () => undefined,
 ): Promise<string> {
   signal.throwIfAborted();
-  const deadline = AbortSignal.timeout(120000);
+  const deadline = AbortSignal.timeout(TWO_CAPTCHA_BUDGET_MS);
   const combined = AbortSignal.any([signal, deadline]);
   async function request(method: "createTask" | "getTaskResult", payload: object) {
     try {
@@ -132,8 +137,9 @@ export async function solveRecaptchaV2(
   log(`2Captcha createTask sent in ${formatDuration(Date.now() - createStart)}; taskId=${created.taskId ?? "none"}.`);
   if (created.status === "ready") return token(created);
   if (!created.taskId) throw new TwoCaptchaError("response");
+  log(`2Captcha wait budget ${formatDuration(TWO_CAPTCHA_BUDGET_MS)} (${MAX_POLLS} polls, every ${formatDuration(POLL_INTERVAL_MS)}).`);
   // Official getTaskResult guidance requires at least 5 seconds between polls.
-  for (let poll = 0; poll < 24; poll++) {
+  for (let poll = 0; poll < MAX_POLLS; poll++) {
     try { await delay(5000, undefined, { signal: combined }); }
     catch { if (signal.aborted) throw signal.reason; throw new TwoCaptchaError("timeout"); }
     // Only polling is retried on transient HTTP/network failures (createTask never is).
@@ -146,8 +152,11 @@ export async function solveRecaptchaV2(
         catch { if (signal.aborted) throw signal.reason; throw new TwoCaptchaError("timeout"); }
       }
     }
-    log(`2Captcha poll ${poll + 1}/24: ${result.status ?? "unknown"}; ${formatDuration(Date.now() - createStart)} since createTask.`);
-    if (result.status === "ready") return token(result);
+    log(`2Captcha poll ${poll + 1}/${MAX_POLLS}: ${result.status ?? "unknown"}; ${formatDuration(Date.now() - createStart)} since createTask.`);
+    if (result.status === "ready") {
+      log(`2Captcha result received after ${formatDuration(Date.now() - createStart)}.`);
+      return token(result);
+    }
     if (result.status !== "idle" && result.status !== "processing")
       throw new TwoCaptchaError("response");
   }
