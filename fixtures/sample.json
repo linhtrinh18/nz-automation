@@ -1,0 +1,295 @@
+{
+  "dataKind": "fictional",
+  "personal": {
+    "familyName": "Chaiyaporn",
+    "givenName1": "Niran",
+    "givenName2": "Example",
+    "givenName3": "Test",
+    "otherNames": "Niran Example",
+    "title": "6",
+    "otherTitle": "Mx",
+    "gender": "M",
+    "dateOfBirth": "14 June, 2000",
+    "countryOfBirth": "214",
+    "streetNumber": "42",
+    "streetName": "Example Street",
+    "suburb": "Example District",
+    "city": "Bangkok",
+    "province": "Bangkok",
+    "postalCode": "10110",
+    "country": "214",
+    "phoneDay": "66 2 0000000",
+    "phoneNight": "66 2 0000000",
+    "phoneMobile": "66 80 0000000",
+    "fax": "66 2 0000001",
+    "email": "niran.chaiyaporn@example.invalid",
+    "representedByAdviser": "Yes",
+    "communicationMethod": "1",
+    "hasPaymentCard": "Yes"
+  },
+  "identification": {
+    "passportNumber": "AA0000001",
+    "confirmPassportNumber": "AA0000001",
+    "passportExpiry": "14 June, 2032",
+    "identificationType": "1",
+    "identificationIssued": "14 June, 2021",
+    "identificationExpiry": "14 June, 2031"
+  },
+  "occupation": {
+    "industrySearch": "Computer",
+    "occupationSearch": "Software Engineer",
+    "industryResult": "L783400 Computer Consultancy Services",
+    "occupationResult": "Software Engineer"
+  },
+  "health": {
+    "renalDialysis": "No",
+    "tuberculosis": "No",
+    "cancer": "No",
+    "heartDisease": "Yes",
+    "disability": "No",
+    "hospitalisation": "No",
+    "residentialCare": "No",
+    "details": "Fictional scenario: stable congenital heart condition, no hospitalisation or residential care anticipated.",
+    "tbRisk": "Yes"
+  },
+  "character": {
+    "imprisonment5Years": "No",
+    "imprisonment12Months": "No",
+    "deported": "No",
+    "deportedDate": "",
+    "deportedCountry": "",
+    "charged": "No",
+    "convicted": "No",
+    "underInvestigation": "No",
+    "excluded": "No",
+    "removed": "No",
+    "details": ""
+  },
+  "adviser": {
+    "adviserType": "2",
+    "exemptionReason": "1",
+    "nzbn": "",
+    "familyName": "Example",
+    "givenName1": "Alex",
+    "givenName2": "Test",
+    "company": "Fictional Family Advice",
+    "streetNumber": "10",
+    "streetName": "Example Road",
+    "suburb": "Example Suburb",
+    "city": "Wellington",
+    "province": "Wellington",
+    "postalCode": "6011",
+    "phone": "64 4 0000000",
+    "phoneDdi": "64 4 0000001",
+    "phoneMobile": "64 21 0000000",
+    "fax": "64 4 0000002",
+    "email": "alex.example@example.invalid",
+    "authorise": "Yes",
+    "residentNz": "Yes"
+  },
+  "workingHoliday": {
+    "previousVisa": "No",
+    "sufficientFunds": "Yes",
+    "intendedTravel": "14 June, 2027",
+    "beenToNz": "Yes",
+    "previousVisitDate": "14 June, 2024",
+    "outwardTicketFunds": "Yes",
+    "meetsRequirements": "Yes"
+  },
+  "scenarios": [
+    {
+      "name": "other-title-and-identity-expiry",
+      "changes": {
+        "personal": {
+          "title": "6",
+          "otherTitle": "Mx"
+        },
+        "identification": {
+          "identificationType": "1",
+          "identificationIssued": "14 June, 2021",
+          "identificationExpiry": "14 June, 2031"
+        }
+      },
+      "notes": "Other title and fictional driver licence dates."
+    },
+    {
+      "name": "medical-details",
+      "changes": {
+        "health": {
+          "heartDisease": "Yes",
+          "details": "Fictional scenario: stable congenital heart condition, no hospitalisation or residential care anticipated."
+        }
+      },
+      "notes": "Positive medical answer with detail. Not an eligibility assessment."
+    },
+    {
+      "name": "character-details-and-previous-visit",
+      "changes": {
+        "character": {
+          "deported": "Yes",
+          "deportedDate": "14 June, 2022",
+          "deportedCountry": "16",
+          "charged": "Yes",
+          "details": "Fictional scenario: charged with a minor offence in Australia in 2022; charge dismissed; later deported for an unrelated visa overstay."
+        },
+        "workingHoliday": {
+          "beenToNz": "Yes",
+          "previousVisitDate": "14 June, 2024"
+        }
+      },
+      "notes": "Deportation and charge details plus a previous NZ visit without a previous WH visa."
+    },
+    {
+      "name": "adviser-exempt",
+      "changes": {
+        "personal": {
+          "representedByAdviser": "Yes"
+        },
+        "adviser": {
+          "adviserType": "2",
+          "familyName": "Example",
+          "givenName1": "Alex",
+          "givenName2": "Test",
+          "company": "Fictional Family Advice",
+          "streetNumber": "10",
+          "streetName": "Example Road",
+          "suburb": "Example Suburb",
+          "city": "Wellington",
+          "province": "Wellington",
+          "postalCode": "6011",
+          "phone": "64 4 0000000",
+          "phoneDdi": "64 4 0000001",
+          "phoneMobile": "64 21 0000000",
+          "fax": "64 4 0000002",
+          "email": "alex.example@example.invalid",
+          "authorise": "Yes",
+          "residentNz": "Yes",
+          "exemptionReason": "1",
+          "nzbn": ""
+        }
+      },
+      "notes": "Fictional informal family adviser; the site requires a company/organisation label even in this branch. NZBN is not applicable to the chosen exemption branch."
+    },
+    {
+      "name": "adviser-licensed",
+      "changes": {
+        "personal": {
+          "representedByAdviser": "Yes"
+        },
+        "adviser": {
+          "adviserType": "1",
+          "familyName": "Example",
+          "givenName1": "Alex",
+          "givenName2": "Test",
+          "company": "Fictional Advice Example",
+          "streetNumber": "10",
+          "streetName": "Example Road",
+          "suburb": "Example Suburb",
+          "city": "Wellington",
+          "province": "Wellington",
+          "postalCode": "6011",
+          "phone": "64 4 0000000",
+          "phoneDdi": "64 4 0000001",
+          "phoneMobile": "64 21 0000000",
+          "fax": "64 4 0000002",
+          "email": "alex.example@example.invalid",
+          "authorise": "Yes",
+          "residentNz": "Yes",
+          "exemptionReason": "",
+          "nzbn": ""
+        }
+      },
+      "notes": "Fictional licensed-type scenario, not a licence claim. Licence-specific fields are blocked and unmapped; no invented selector."
+    },
+    {
+      "name": "adviser-unlicensed",
+      "changes": {
+        "personal": {
+          "representedByAdviser": "Yes"
+        },
+        "adviser": {
+          "adviserType": "3",
+          "familyName": "Example",
+          "givenName1": "Alex",
+          "givenName2": "Test",
+          "company": "Fictional Advice Example",
+          "streetNumber": "10",
+          "streetName": "Example Road",
+          "suburb": "Example Suburb",
+          "city": "Wellington",
+          "province": "Wellington",
+          "postalCode": "6011",
+          "phone": "64 4 0000000",
+          "phoneDdi": "64 4 0000001",
+          "phoneMobile": "64 21 0000000",
+          "fax": "64 4 0000002",
+          "email": "alex.example@example.invalid",
+          "authorise": "Yes",
+          "residentNz": "Yes",
+          "exemptionReason": "",
+          "nzbn": ""
+        }
+      },
+      "notes": "Unlicensed adviser scenario for client control coverage only; not a claim of scheme eligibility."
+    },
+    {
+      "name": "all-editable-controls",
+      "changes": {
+        "personal": {
+          "title": "6",
+          "otherTitle": "Mx",
+          "representedByAdviser": "Yes"
+        },
+        "identification": {
+          "identificationType": "1",
+          "identificationIssued": "14 June, 2021",
+          "identificationExpiry": "14 June, 2031"
+        },
+        "health": {
+          "heartDisease": "Yes",
+          "details": "Fictional scenario: stable congenital heart condition, no hospitalisation or residential care anticipated."
+        },
+        "character": {
+          "imprisonment5Years": "No",
+          "imprisonment12Months": "No",
+          "deported": "No",
+          "deportedDate": "",
+          "deportedCountry": "",
+          "charged": "No",
+          "convicted": "No",
+          "underInvestigation": "No",
+          "excluded": "No",
+          "removed": "No",
+          "details": ""
+        },
+        "workingHoliday": {
+          "beenToNz": "Yes",
+          "previousVisitDate": "14 June, 2024"
+        },
+        "adviser": {
+          "adviserType": "2",
+          "familyName": "Example",
+          "givenName1": "Alex",
+          "givenName2": "Test",
+          "company": "Fictional Family Advice",
+          "streetNumber": "10",
+          "streetName": "Example Road",
+          "suburb": "Example Suburb",
+          "city": "Wellington",
+          "province": "Wellington",
+          "postalCode": "6011",
+          "phone": "64 4 0000000",
+          "phoneDdi": "64 4 0000001",
+          "phoneMobile": "64 21 0000000",
+          "fax": "64 4 0000002",
+          "email": "alex.example@example.invalid",
+          "authorise": "Yes",
+          "residentNz": "Yes",
+          "exemptionReason": "1",
+          "nzbn": ""
+        }
+      },
+      "notes": "Fictional informal family adviser; the site requires a company/organisation label even in this branch. NZBN is not applicable to the chosen exemption branch. Uses non-adverse Character answers; deportation and charge controls are covered only by character-details-and-previous-visit, which may trigger the site character rejection."
+    }
+  ]
+}
