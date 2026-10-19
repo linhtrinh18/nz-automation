@@ -17,7 +17,10 @@ import { scenarioData, validateData } from "./data-validation";
 export { scenarioData, validateData } from "./data-validation";
 export { WorkingHolidayStop } from "./errors";
 import { chooseBrowser } from "../browser/chooseBrowser";
-import { pipelineSnapshot } from "./tab-pipeline";
+import {
+  DOWNGRADE_PHASE_MESSAGE, PipelineAbort, SECTION_FAILED_DETAIL, SKIPPED_DETAIL, TabScheduler, pipelineSnapshot, runPipelinedSections,
+  type PipelineRunResult, type SectionTab, type TabOps,
+} from "./tab-pipeline";
 import { windowSizedAtLaunch } from "../browser/window-size";
 
 import { AUTH_STATE_JS, readAuthState } from "./auth-state";
@@ -76,6 +79,8 @@ const execution = new AsyncLocalStorage<{
   currentSection?: string;
   /** True while the tab pipeline is active: keyed events must name their section. */
   pipelineActive?: boolean;
+  /** Pipeline: called when a CAPTCHA was solved while the pipeline is active. */
+  onChallenge?: () => void;
   /** Credential validation started at a section boundary, awaited right before that section's own SAVE. */
   validations: Map<string, Promise<void>>;
   captchaMode?: "manual" | "capsolver" | "2captcha" | "autocaptcha";
@@ -391,6 +396,7 @@ export async function captchaGuard(driver: WebDriver): Promise<boolean> {
   if (solvedAt && applied) {
     trace(`summary: solved by ${providerName} in ${formatDuration(solvedAt - captchaStartedAt)}, accepted ${formatDuration(Date.now() - applied.at)} after injection, total ${since()}.`);
   } else trace(`summary: completed manually/without provider token, total ${since()}.`);
+  context?.onChallenge?.();
   console.log(
     `[NZWH] CAPTCHA completion detected after ${Math.round((Date.now() - captchaStartedAt) / 1000)}s. Resuming automatically.`,
   );
@@ -403,6 +409,7 @@ export async function waitWithCaptcha<T>(
   condition: () => Promise<T>,
   timeout: number,
   pollMs = PAGE_POLL_MS,
+  between?: () => Promise<void>,
 ): Promise<NonNullable<T>> {
   let deadline = Date.now() + timeout;
   while (true) {
@@ -415,6 +422,8 @@ export async function waitWithCaptcha<T>(
     if (value) return value as NonNullable<T>;
     if (Date.now() >= deadline)
       throw new webdriverError.TimeoutError("Page condition did not become ready.");
+    // Pipeline: background tabs advance one cheap step while this tab waits.
+    await between?.();
     await new Promise(resolve => setTimeout(resolve, pollMs));
   }
 }
@@ -839,7 +848,7 @@ async function activateChrome(driver: WebDriver): Promise<void> {
 type EntryMode = { fast: boolean; early: boolean };
 const LEGACY_ENTRY: EntryMode = { fast: false, early: false };
 
-async function waitForSection(driver: WebDriver, name: string, mode: EntryMode = LEGACY_ENTRY): Promise<void> {
+async function waitForSection(driver: WebDriver, name: string, mode: EntryMode = LEGACY_ENTRY, between?: () => Promise<void>): Promise<void> {
   const id = Object.values(steps[name].fields)[0].id;
   const pollMs = mode.fast ? FAST_POLL_MS : PAGE_POLL_MS;
   // E7: fast entry activates the tab only before native input; legacy entry keeps the per-section activation.
@@ -850,14 +859,14 @@ async function waitForSection(driver: WebDriver, name: string, mode: EntryMode =
       checkCancelled();
       await requireSession(driver);
       return sectionDomReady(driver, id);
-    }, EARLY_SECTION_WAIT_MS, FAST_POLL_MS);
+    }, EARLY_SECTION_WAIT_MS, FAST_POLL_MS, between);
     return;
   }
   await ready(driver, pollMs);
   await waitWithCaptcha(driver, async () => {
     await requireSession(driver);
     return (await driver.findElements(By.id(id))).length === 1;
-  }, SECTION_WAIT_MS, pollMs);
+  }, SECTION_WAIT_MS, pollMs, between);
 }
 
 async function remoteTrigger(
@@ -1942,8 +1951,8 @@ async function executeWorkingHoliday(
   if (mode !== "loginOnly") validateData(data);
   const fast = mode !== "loginOnly" && fastEntrySnapshot();
   const requestedEager = earlyEntrySnapshot(fast);
-  for (const line of pipelineSnapshot(process.env, { attachPort: options.attachPort, fast, early: requestedEager, loginOnly: mode === "loginOnly" }).log)
-    console.log(line);
+  const pipeline = pipelineSnapshot(process.env, { attachPort: options.attachPort, fast, early: requestedEager, loginOnly: mode === "loginOnly" });
+  for (const line of pipeline.log) console.log(line);
   if (mode !== "loginOnly" && base.dataKind === "fictional" && !options.allowFictionalDraftSave)
     throw new WorkingHolidayStop(
       "Saving fictional values in the existing live draft requires explicit --allow-fictional-draft-save opt-in.",
@@ -2201,34 +2210,198 @@ async function executeWorkingHoliday(
         }
       }
     };
-    for (const [sectionIndex, name] of selected.entries()) {
-      if (
-        options.taskKeys &&
-        !options.taskKeys.includes(`${scenario}:${name}`)
-      )
-        continue;
-      await sectionBoundary(name);
-      console.log(
-        `[NZWH] Opening section ${sectionIndex + 1}/${selected.length}: ${name}. url=${await driver.getCurrentUrl().then((u) => new URL(u).pathname).catch(() => "?")}`,
-      );
-      if (name === "adviser" && data.personal.representedByAdviser !== "Yes") {
-        console.log(
-          "[NZWH] Adviser skipped: personal.representedByAdviser is No. Use an adviser scenario to fill this section.",
-        );
-        await execution.getStore()?.validations.get(name); // a skipped section still honors its boundary validation
-        continue;
+    const keyed = <E extends ExecutionEvent>(name: string, event: E, background: boolean): E =>
+      execution.getStore()?.pipelineActive ? { ...event, section: name, ...(background ? { background: true } : {}) } as E : event;
+    const writeSaved = () => writeFile(join(reportDirectory, "coverage-saved.json"), `${JSON.stringify(saved, null, 2)}\n`);
+    /** Verified section: coverage + result event. Shared by the sequential path and pipeline outcomes. */
+    const completeSection = async (name: SectionName, report: SavedSection, background = false) => {
+      saved[name] = report;
+      completedSections.push(name);
+      await writeSaved();
+      await emit(keyed(name, {
+        type: "section-result",
+        status: "completed",
+        detail: "Đã lưu và xác minh sau khi tải lại.",
+        checked: report.persisted.length,
+        blocked: 0,
+      } as const, background));
+    };
+    /** Maps one section error to its outcome (today's catch block). "retry": run the section body again. */
+    const mapSectionError = async (name: SectionName, caught: unknown, session: { recoveredSession: boolean }): Promise<"retry" | "next"> => {
+      let error: unknown = caught;
+      if (error instanceof StopRequested) throw error;
+      if (typeof error === "object" && error && validationFailures.has(error)) throw error;
+      if (error instanceof AccessDeniedError) {
+        checkCancelled();
+        let result: DeniedOutcome;
+        try {
+          result = await recoverFromAccessDenied(name);
+        } catch (recoveryError) {
+          if (recoveryError instanceof StopRequested) throw recoveryError;
+          await emit({
+            type: "section-result",
+            status: "failed",
+            detail: "Không hoàn tất mục này. Kiểm tra Chrome và trạng thái lưu trước khi thử lại.",
+          });
+          throw new WorkingHolidayStop(
+            `Stopped in ${name}. ${recoveryError instanceof WorkingHolidayStop ? recoveryError.message : "Access-denied recovery did not complete. Check the current Chrome page."} Later sections have not run.`,
+          );
+        }
+        if (result.outcome === "retry") return "retry";
+        if (result.outcome === "verified") {
+          saved[name] = { filled: result.keys, persisted: result.keys, lookups: [] };
+          completedSections.push(name);
+          await writeFile(
+            join(reportDirectory, "coverage-saved.json"),
+            `${JSON.stringify(saved, null, 2)}\n`,
+          );
+          console.log(`[NZWH] ${name}: saved values verified after access-denied redirect; nothing was re-sent.`);
+          await emit({ type: "persistence", state: "verified" });
+          await emit({
+            type: "section-result",
+            status: "completed",
+            detail: "Đã xác minh dữ liệu đã lưu sau khi chuyển hướng; không lưu lại.",
+            checked: result.keys.length,
+            blocked: 0,
+          });
+          return "next";
+        }
+        if (result.outcome === "unverified") {
+          unverifiedSections.push(name);
+          console.log(`[NZWH] ${name}: saved values could not be confirmed after access-denied redirect. No repeat SAVE; continuing to the next selected section.`);
+          await emit({
+            type: "section-result",
+            status: "failed",
+            detail: "Website chuyển hướng đến trang access-denied; chưa xác minh được việc lưu. Không tự lưu lại; tiếp tục mục kế tiếp.",
+          });
+          return "next";
+        }
+        // Login form after the redirect: reuse the one-shot re-authentication path below.
+        error = new SessionExpiredError("The form redirected to login; session is no longer authenticated.");
       }
+      {
+        const state = await readAuthState(driver);
+        if (state.rejected)
+          throw new WorkingHolidayStop(loginRejectedMessage);
+        if (error instanceof SessionExpiredError || state.loginForm) {
+          if (sectionRisk(name))
+            throw new WorkingHolidayStop(
+              "Phiên đăng nhập hết hạn sau thao tác có thể lưu dữ liệu. Không tự điền lại. Kiểm tra dữ liệu trên Chrome rồi khôi phục có xác nhận.",
+            );
+          if (session.recoveredSession)
+            throw new WorkingHolidayStop(
+              `Session expired again in ${name}; stopped after one recovery attempt.`,
+            );
+          session.recoveredSession = true;
+          console.log(
+            `[NZWH] ${name}: login redirect detected. Re-authenticating once before retrying this section.`,
+          );
+          await authenticate(driver, false, options.credentials);
+          const links = await driver.findElements(
+            By.css('a[id*="editHyperLink"]'),
+          );
+          let sameDraft = false;
+          for (const link of links) {
+            const candidate = new URL(
+              (await link.getAttribute("href")) ?? "",
+            );
+            assertHost(candidate.href);
+            if (
+              candidate.searchParams.get("ApplicationId") ===
+              applicationPage?.searchParams.get("ApplicationId")
+            )
+              sameDraft = true;
+          }
+          if (!sameDraft)
+            throw new WorkingHolidayStop(
+              "Original draft not found after login; stopped without choosing a different application.",
+            );
+          return "retry";
+        }
+      }
+      if (error instanceof SectionPostbackTimeoutError) {
+        const actual = new URL(await driver.getCurrentUrl());
+        assertHost(actual.href);
+        if (actual.pathname !== `/WorkingHoliday/Wizard/${steps[name].page}` ||
+            actual.searchParams.get("ApplicationId") !== selectedApplicationId)
+          throw error;
+        unverifiedSections.push(name);
+        console.log(`[NZWH] ${error.message} No repeat POST; continuing to the next selected section.`);
+        await emit({
+          type: "section-result", status: "failed",
+          detail: "Hết thời gian chờ phản hồi trên cùng mục hồ sơ. Chưa xác minh việc lưu; không tự gửi lại. Tiếp tục mục kế tiếp.",
+        });
+        return "next";
+      }
+      if (error instanceof SavedValueVerificationError) {
+        // saveStep only raises this after a successful reload of the same
+        // authenticated section. Do not replay its POST; process the rest.
+        assertHost(await driver.getCurrentUrl());
+        unverifiedSections.push(name);
+        console.log(`[NZWH] ${error.message} No repeat SAVE; continuing to the next selected section.`);
+        await emit({
+          type: "section-result",
+          status: "failed",
+          detail: `Đã nhận phản hồi lưu nhưng các trường chưa khớp: ${error.fields.join(", ")}. Không tự lưu lại; tiếp tục mục kế tiếp.`,
+          checked: error.checked,
+          blocked: error.fields.length,
+        });
+        return "next";
+      }
+      if (error instanceof SiteBusyError) {
+        assertHost(await driver.getCurrentUrl());
+        skippedBusy.push(name);
+        // A busy response cannot establish whether the last POST persisted.
+        delete saved[name];
+        await writeFile(
+          join(reportDirectory, "coverage-saved.json"),
+          `${JSON.stringify(saved, null, 2)}\n`,
+        );
+        await writeFile(
+          join(reportDirectory, "coverage-busy.json"),
+          `${JSON.stringify({ skippedUnverified: skippedBusy }, null, 2)}\n`,
+        );
+        await emit({
+          type: "section-result",
+          status: "failed",
+          detail:
+            "Trang đích bận. Chưa xác minh việc lưu; không tự thử lại. Các mục tiếp theo vẫn được xử lý.",
+        });
+        console.log(
+          `[NZWH] ${name}: site returned Please try again later. Save state is unverified; moving to the next form section in this same tab.`,
+        );
+        return "next";
+      }
+      await emit({
+        type: "section-result",
+        status: "failed",
+        detail:
+          "Không hoàn tất mục này. Kiểm tra Chrome và trạng thái lưu trước khi thử lại.",
+      });
+      const reason =
+        error instanceof WorkingHolidayStop
+          ? error.message
+          : "Form interaction or page load did not complete. Check the current Chrome page.";
+      throw new WorkingHolidayStop(
+        `Stopped in ${name}. ${reason} Later sections have not run.`,
+      );
+    };
+    const sectionUrl = (name: SectionName) =>
+      `${origin}/WorkingHoliday/Wizard/${steps[name].page}?${applicationPage?.searchParams.toString()}`;
+    /** Sequential section: GET, fill, SAVE, reload verification, in the current tab. */
+    const runSection = async (name: SectionName, opts: { started?: boolean; initialError?: unknown } = {}): Promise<void> => {
       const context = execution.getStore();
       context?.riskBySection.set(name, false);
-      await emit({
-        type: "section-start",
-        section: name,
-        scenario: scenario,
-      });
-      let recoveredSession = false;
+      if (context) context.currentSection = name;
+      if (!opts.started)
+        await emit({ type: "section-start", section: name, scenario: scenario });
+      const session = { recoveredSession: false };
+      let pending = opts.initialError;
+      let hasPending = "initialError" in opts;
       while (true) {
         try {
-          const url = `${origin}/WorkingHoliday/Wizard/${steps[name].page}?${applicationPage?.searchParams.toString()}`;
+          if (hasPending) { hasPending = false; throw pending; }
+          const url = sectionUrl(name);
           if ((await driver.getCurrentUrl()) !== url)
             await navigate(driver, url);
           await waitForSection(driver, name, entry);
@@ -2242,182 +2415,262 @@ async function executeWorkingHoliday(
             throw new WorkingHolidayStop(
               "Conditional page unavailable or application changed.",
             );
-          saved[name] = await saveStep(driver, name, data, entry);
-          completedSections.push(name);
-          await writeFile(
-            join(reportDirectory, "coverage-saved.json"),
-            `${JSON.stringify(saved, null, 2)}\n`,
-          );
-          await emit({
-            type: "section-result",
-            status: "completed",
-            detail: "Đã lưu và xác minh sau khi tải lại.",
-            checked:
-              saved[name]?.persisted.length ??
-              Object.keys(steps[name].fields).length,
-            blocked: 0,
-          });
-          break;
+          await completeSection(name, await saveStep(driver, name, data, entry));
+          return;
         } catch (caught) {
-          let error: unknown = caught;
-          if (error instanceof StopRequested) throw error;
-          if (typeof error === "object" && error && validationFailures.has(error)) throw error;
-          if (error instanceof AccessDeniedError) {
-            checkCancelled();
-            let result: DeniedOutcome;
-            try {
-              result = await recoverFromAccessDenied(name);
-            } catch (recoveryError) {
-              if (recoveryError instanceof StopRequested) throw recoveryError;
-              await emit({
-                type: "section-result",
-                status: "failed",
-                detail: "Không hoàn tất mục này. Kiểm tra Chrome và trạng thái lưu trước khi thử lại.",
-              });
-              throw new WorkingHolidayStop(
-                `Stopped in ${name}. ${recoveryError instanceof WorkingHolidayStop ? recoveryError.message : "Access-denied recovery did not complete. Check the current Chrome page."} Later sections have not run.`,
-              );
-            }
-            if (result.outcome === "retry") continue;
-            if (result.outcome === "verified") {
-              saved[name] = { filled: result.keys, persisted: result.keys, lookups: [] };
-              completedSections.push(name);
-              await writeFile(
-                join(reportDirectory, "coverage-saved.json"),
-                `${JSON.stringify(saved, null, 2)}\n`,
-              );
-              console.log(`[NZWH] ${name}: saved values verified after access-denied redirect; nothing was re-sent.`);
-              await emit({ type: "persistence", state: "verified" });
-              await emit({
-                type: "section-result",
-                status: "completed",
-                detail: "Đã xác minh dữ liệu đã lưu sau khi chuyển hướng; không lưu lại.",
-                checked: result.keys.length,
-                blocked: 0,
-              });
-              break;
-            }
-            if (result.outcome === "unverified") {
-              unverifiedSections.push(name);
-              console.log(`[NZWH] ${name}: saved values could not be confirmed after access-denied redirect. No repeat SAVE; continuing to the next selected section.`);
-              await emit({
-                type: "section-result",
-                status: "failed",
-                detail: "Website chuyển hướng đến trang access-denied; chưa xác minh được việc lưu. Không tự lưu lại; tiếp tục mục kế tiếp.",
-              });
-              break;
-            }
-            // Login form after the redirect: reuse the one-shot re-authentication path below.
-            error = new SessionExpiredError("The form redirected to login; session is no longer authenticated.");
-          }
-          {
-            const state = await readAuthState(driver);
-            if (state.rejected)
-              throw new WorkingHolidayStop(loginRejectedMessage);
-            if (error instanceof SessionExpiredError || state.loginForm) {
-              if (sectionRisk(name))
-                throw new WorkingHolidayStop(
-                  "Phiên đăng nhập hết hạn sau thao tác có thể lưu dữ liệu. Không tự điền lại. Kiểm tra dữ liệu trên Chrome rồi khôi phục có xác nhận.",
-                );
-              if (recoveredSession)
-                throw new WorkingHolidayStop(
-                  `Session expired again in ${name}; stopped after one recovery attempt.`,
-                );
-              recoveredSession = true;
-              console.log(
-                `[NZWH] ${name}: login redirect detected. Re-authenticating once before retrying this section.`,
-              );
-              await authenticate(driver, false, options.credentials);
-              const links = await driver.findElements(
-                By.css('a[id*="editHyperLink"]'),
-              );
-              let sameDraft = false;
-              for (const link of links) {
-                const candidate = new URL(
-                  (await link.getAttribute("href")) ?? "",
-                );
-                assertHost(candidate.href);
-                if (
-                  candidate.searchParams.get("ApplicationId") ===
-                  applicationPage?.searchParams.get("ApplicationId")
-                )
-                  sameDraft = true;
-              }
-              if (!sameDraft)
-                throw new WorkingHolidayStop(
-                  "Original draft not found after login; stopped without choosing a different application.",
-                );
-              continue;
-            }
-          }
-          if (error instanceof SectionPostbackTimeoutError) {
-            const actual = new URL(await driver.getCurrentUrl());
-            assertHost(actual.href);
-            if (actual.pathname !== `/WorkingHoliday/Wizard/${steps[name].page}` ||
-                actual.searchParams.get("ApplicationId") !== selectedApplicationId)
-              throw error;
-            unverifiedSections.push(name);
-            console.log(`[NZWH] ${error.message} No repeat POST; continuing to the next selected section.`);
-            await emit({
-              type: "section-result", status: "failed",
-              detail: "Hết thời gian chờ phản hồi trên cùng mục hồ sơ. Chưa xác minh việc lưu; không tự gửi lại. Tiếp tục mục kế tiếp.",
-            });
-            break;
-          }
-          if (error instanceof SavedValueVerificationError) {
-            // saveStep only raises this after a successful reload of the same
-            // authenticated section. Do not replay its POST; process the rest.
-            assertHost(await driver.getCurrentUrl());
-            unverifiedSections.push(name);
-            console.log(`[NZWH] ${error.message} No repeat SAVE; continuing to the next selected section.`);
-            await emit({
-              type: "section-result",
-              status: "failed",
-              detail: `Đã nhận phản hồi lưu nhưng các trường chưa khớp: ${error.fields.join(", ")}. Không tự lưu lại; tiếp tục mục kế tiếp.`,
-              checked: error.checked,
-              blocked: error.fields.length,
-            });
-            break;
-          }
-          if (error instanceof SiteBusyError) {
-            assertHost(await driver.getCurrentUrl());
-            skippedBusy.push(name);
-            // A busy response cannot establish whether the last POST persisted.
-            delete saved[name];
-            await writeFile(
-              join(reportDirectory, "coverage-saved.json"),
-              `${JSON.stringify(saved, null, 2)}\n`,
-            );
-            await writeFile(
-              join(reportDirectory, "coverage-busy.json"),
-              `${JSON.stringify({ skippedUnverified: skippedBusy }, null, 2)}\n`,
-            );
-            await emit({
-              type: "section-result",
-              status: "failed",
-              detail:
-                "Trang đích bận. Chưa xác minh việc lưu; không tự thử lại. Các mục tiếp theo vẫn được xử lý.",
-            });
-            console.log(
-              `[NZWH] ${name}: site returned Please try again later. Save state is unverified; moving to the next form section in this same tab.`,
-            );
-            break;
-          }
-          await emit({
-            type: "section-result",
-            status: "failed",
-            detail:
-              "Không hoàn tất mục này. Kiểm tra Chrome và trạng thái lưu trước khi thử lại.",
-          });
-          const reason =
-            error instanceof WorkingHolidayStop
-              ? error.message
-              : "Form interaction or page load did not complete. Check the current Chrome page.";
-          throw new WorkingHolidayStop(
-            `Stopped in ${name}. ${reason} Later sections have not run.`,
-          );
+          if ((await mapSectionError(name, caught, session)) === "retry") continue;
+          return;
         }
       }
+    };
+    // ---- Tab pipeline (NZWH_TAB_PIPELINE=verify|save); every function below is unused when the mode is off. ----
+    const reasonOf = (error: unknown) =>
+      error instanceof WorkingHolidayStop ? error.message : "Form interaction or page load did not complete. Check the current Chrome page.";
+    const firstFieldId = (name: SectionName) => Object.values(steps[name].fields)[0].id;
+    const backgroundOps = (): TabOps => ({
+      newTab: async () => {
+        await driver.switchTo().newWindow("tab");
+        const handle = await driver.getWindowHandle();
+        await activateChrome(driver);
+        return handle;
+      },
+      closeTab: async () => { await driver.close(); },
+      focus: async (handle) => { await driver.switchTo().window(handle); await activateChrome(driver); },
+      rescan: async () => {
+        try {
+          if (!(await documentComplete(driver))) return "pending";
+          return await driver.executeScript<number>(ERROR_LABEL_SCAN_JS);
+        } catch (error) { if (isNavigationError(error)) return "pending"; throw error; }
+      },
+      startReload: async (tab) => {
+        tab.stamp = await readTimeOrigin(driver);
+        await driver.executeScript("location.href = arguments[0]", (tab.ticket as SavedTicket).url);
+      },
+      pollReload: async (tab) => {
+        try {
+          const probe = await readPageProbe(driver);
+          if (probe) {
+            if (probe.site === "denied") return "denied";
+            if (probe.site) return "busy";
+            if (probe.auth.rejected || probe.auth.loginForm) return "login";
+            if (probe.captcha) return "captcha";
+          } else {
+            const site = await driver.executeScript<unknown>(SITE_STATE_JS);
+            if (site === "denied") return "denied";
+            if (site) return "busy";
+            const auth = await readAuthState(driver);
+            if (auth.rejected || auth.loginForm) return "login";
+            if (await captchaPending(driver)) return "captcha";
+          }
+          if ((await readTimeOrigin(driver)) === tab.stamp) return "pending";
+          return (await sectionDomReady(driver, firstFieldId(tab.name))) ? "ready" : "pending";
+        } catch (error) { if (isNavigationError(error)) return "pending"; throw error; }
+      },
+      readback: async (tab) => {
+        const ticket = tab.ticket as SavedTicket;
+        try {
+          const actual = new URL(await driver.getCurrentUrl());
+          const original = new URL(ticket.url);
+          if (actual.origin !== original.origin || actual.pathname !== original.pathname ||
+              actual.searchParams.get("ApplicationId") !== original.searchParams.get("ApplicationId")) return { kind: "unexpected" };
+          const ids = ticket.verifyKeys.map((key) => steps[tab.name].fields[key].id);
+          const read = await readFieldValues(driver, ids);
+          const wrong = ticket.verifyKeys.filter((key, position) =>
+            read.values[position] !== expectedFieldValue(tab.name, key, data[tab.name][key]));
+          // Early entry reads at DOM-ready: re-read once the document is complete before concluding.
+          if (wrong.length && !(await documentComplete(driver))) return { kind: "pending" };
+          if (wrong.length) {
+            for (const key of wrong) {
+              const position = ticket.verifyKeys.indexOf(key);
+              console.log(`[NZWH] Saved-value mismatch ${tab.name}.${key}: ${savedValueDiagnostic(expectedFieldValue(tab.name, key, data[tab.name][key]), read.values[position])}; section=${steps[tab.name].page}. No applicant values logged.`);
+            }
+            return { kind: "mismatch", fields: wrong.map((key) => `${tab.name}.${key}`), checked: ticket.verifyKeys.length - wrong.length };
+          }
+          ticket.report.persisted.push(...ticket.verifyKeys);
+          return { kind: "ok" };
+        } catch (error) { if (isNavigationError(error)) return { kind: "pending" }; throw error; }
+      },
+      emit,
+      sleep,
+      now: () => Date.now(),
+      aborted: () => execution.getStore()?.signal?.aborted ?? false,
+    });
+    /** Reports one tab's terminal outcome exactly as the sequential path would (events, coverage files, logs). */
+    const applyOutcome = (scheduler: TabScheduler) => async (tab: SectionTab, _finalizing: boolean): Promise<void> => {
+      const { name, outcome } = tab;
+      const ticket = tab.ticket as SavedTicket;
+      if (!outcome) return;
+      const verifyMs = Date.now() - (tab.verifyStartedAt ?? Date.now());
+      if (outcome.kind === "verified") {
+        console.log(`[NZWH] ${name}: saved and verified after reload.`);
+        await emit(keyed(name, { type: "persistence", state: "verified" } as const, true));
+        await completeSection(name, ticket.report, true);
+        logSectionTiming(ticket, verifyMs, null, ` (overlapped ${verifyMs}ms), drain ${scheduler.drainMs}ms`);
+      } else if (outcome.kind === "unverified") {
+        unverifiedSections.push(name);
+        if (outcome.reason === "mismatch") {
+          const fields = outcome.fields ?? [];
+          console.log(`[NZWH] ${new SavedValueVerificationError(fields, outcome.checked ?? 0).message} No repeat SAVE; continuing to the next selected section.`);
+          await emit(keyed(name, {
+            type: "section-result", status: "failed",
+            detail: `Đã nhận phản hồi lưu nhưng các trường chưa khớp: ${fields.join(", ")}. Không tự lưu lại; tiếp tục mục kế tiếp.`,
+            checked: outcome.checked, blocked: fields.length,
+          } as const, true));
+        } else {
+          console.log(`[NZWH] ${new SectionPostbackTimeoutError(name).message} No repeat POST; continuing to the next selected section.`);
+          await emit(keyed(name, {
+            type: "section-result", status: "failed",
+            detail: outcome.reason === "denied"
+              ? "Website chuyển hướng đến trang access-denied; chưa xác minh được việc lưu. Không tự lưu lại; tiếp tục mục kế tiếp."
+              : "Hết thời gian chờ phản hồi trên cùng mục hồ sơ. Chưa xác minh việc lưu; không tự gửi lại. Tiếp tục mục kế tiếp.",
+          } as const, true));
+        }
+      } else if (outcome.kind === "busy") {
+        skippedBusy.push(name);
+        delete saved[name];
+        await writeSaved();
+        await writeFile(join(reportDirectory, "coverage-busy.json"), `${JSON.stringify({ skippedUnverified: skippedBusy }, null, 2)}\n`);
+        await emit(keyed(name, {
+          type: "section-result", status: "failed",
+          detail: "Trang đích bận. Chưa xác minh việc lưu; không tự thử lại. Các mục tiếp theo vẫn được xử lý.",
+        } as const, true));
+        console.log(`[NZWH] ${name}: site returned Please try again later. Save state is unverified; the pipeline will finish the other tabs read-only.`);
+      } else if (!tab.reported) {
+        await emit(keyed(name, { type: "section-result", status: "failed", detail: SECTION_FAILED_DETAIL } as const, true));
+      }
+    };
+    /** Finishes one posted tab read-only (reload + readback) in its own tab, with the sequential error mapping. */
+    const finishReadOnly = async (scheduler: TabScheduler, tab: SectionTab): Promise<void> => {
+      const context = execution.getStore();
+      await scheduler.focus(tab.handle);
+      if (context) context.currentSection = tab.name;
+      try {
+        if (tab.phase === "domready") {
+          await waitWithCaptcha(driver, () => documentComplete(driver), READY_WAIT_MS, FAST_POLL_MS);
+          const flagged = await driver.executeScript<number>(ERROR_LABEL_SCAN_JS);
+          if (flagged) {
+            await emit(keyed(tab.name, { type: "section-result", status: "failed", detail: SECTION_FAILED_DETAIL } as const, false));
+            tab.phase = "done";
+            throw new WorkingHolidayStop(`Server validation flagged ${flagged} fields in ${tab.name} after load; stopped before next section.`);
+          }
+          await emit(keyed(tab.name, { type: "persistence", state: "accepted" } as const, false));
+        }
+        await completeSection(tab.name, await verifySection(driver, tab.ticket as SavedTicket, data, { reload: true }));
+      } catch (error) {
+        if (tab.phase === "done" && error instanceof WorkingHolidayStop) throw error;
+        await mapSectionError(tab.name, error, { recoveredSession: false });
+      }
+      tab.phase = "done";
+    };
+    const runPipeline = async (names: SectionName[], mode: "verify" | "save", barrier: "verified" | "accepted"): Promise<void> => {
+      const context = execution.getStore()!;
+      const main = await driver.getWindowHandle();
+      let scheduler!: TabScheduler;
+      scheduler = new TabScheduler(backgroundOps(), main, { onOutcome: (tab, finalizing) => applyOutcome(scheduler)(tab, finalizing) },
+        { verifyTimeoutMs: READY_WAIT_MS + SECTION_WAIT_MS, pollMs: FAST_POLL_MS });
+      context.pipelineActive = true;
+      context.onChallenge = () => scheduler.noteChallenge();
+      let lastUrl: string | undefined;
+      const location = async (handle: string, fn: () => Promise<void>) => {
+        const previous = scheduler.focused;
+        await scheduler.focus(handle);
+        try { await fn(); } finally { await scheduler.focus(previous); }
+      };
+      try {
+        let result: PipelineRunResult;
+        try {
+          result = await runPipelinedSections<SavedTicket>(names, {
+            scheduler, mode, barrier,
+            boundary: (name, prefetch) => sectionBoundary(name, prefetch),
+            begin: async (name) => {
+              context.riskBySection.set(name, false);
+              console.log(`[NZWH] Opening section ${selected.indexOf(name) + 1}/${selected.length}: ${name} (tab pipeline).`);
+              await emit({ type: "section-start", section: name, scenario });
+            },
+            load: (name, handle) => location(handle, async () => {
+              await driver.executeScript("location.href = arguments[0]", sectionUrl(name));
+            }),
+            fill: async (name, _tab, ctl) => {
+              context.currentSection = name;
+              await waitForSection(driver, name, entry, ctl.drain);
+              const actual = new URL(await driver.getCurrentUrl());
+              assertHost(actual.href);
+              if (actual.pathname !== `/WorkingHoliday/Wizard/${steps[name].page}` ||
+                  actual.searchParams.get("ApplicationId") !== applicationPage?.searchParams.get("ApplicationId"))
+                throw new WorkingHolidayStop("Conditional page unavailable or application changed.");
+              const ticket = await saveSection(driver, name, data, entry, { interactive: true, beforePost: ctl.beforePost });
+              lastUrl = ticket.url;
+              return ticket;
+            },
+            skip: async (name) => {
+              await emit(keyed(name, { type: "section-result", status: "skipped", detail: SKIPPED_DETAIL } as const, true));
+            },
+            log: (message) => console.log(message),
+          });
+        } catch (error) {
+          if (error instanceof PipelineAbort) {
+            await scheduler.finalizeInFlight((message) => console.log(message));
+            throw new WorkingHolidayStop(`Stopped in ${error.section}. ${reasonOf(error.reason)} Later sections have not run.`);
+          }
+          throw error;
+        }
+        if (!result.downgraded) {
+          const foregroundWasExtra = scheduler.focused !== main;
+          await scheduler.closeExtra();
+          context.pipelineActive = false;
+          // The submission phase continues in the main tab; put it on the last section page like the sequential run.
+          if (foregroundWasExtra && lastUrl) await navigate(driver, lastUrl);
+          return;
+        }
+        console.log(`[NZWH] Tab pipeline downgraded to off: ${result.downgraded}.`);
+        await emit({ type: "phase", phase: "recovery", message: DOWNGRADE_PHASE_MESSAGE });
+        // Posted tabs finish read-only in their own tabs, earliest section first; nothing is ever re-sent.
+        for (const tab of scheduler.tabs.filter((candidate) => candidate.phase !== "done")) {
+          if (result.errorPosted && tab.name === result.errorSection) {
+            await scheduler.focus(tab.handle);
+            context.currentSection = tab.name;
+            await mapSectionError(tab.name, result.error, { recoveredSession: false });
+            tab.phase = "done";
+          } else await finishReadOnly(scheduler, tab);
+        }
+        await scheduler.closeExtra();
+        context.pipelineActive = false;
+        for (const rest of result.remaining) {
+          const carried = result.error !== undefined && !result.errorPosted && rest.name === result.errorSection;
+          await runSection(rest.name, { started: rest.started, ...(carried ? { initialError: result.error } : {}) });
+        }
+      } finally {
+        context.pipelineActive = false;
+        context.onChallenge = undefined;
+        await scheduler.closeExtra();
+      }
+    };
+    const adviserSkipped = (name: SectionName) => name === "adviser" && data.personal.representedByAdviser !== "Yes";
+    const todo = selected.filter((name) => !options.taskKeys || options.taskKeys.includes(`${scenario}:${name}`));
+    let sequentialDone = 0;
+    for (const [position, name] of todo.entries()) {
+      if (pipeline.mode !== "off" && sequentialDone >= 1) {
+        const rest = todo.slice(position).filter((candidate) => !adviserSkipped(candidate));
+        if (rest.length >= 2) {
+          for (const candidate of todo.slice(position)) if (adviserSkipped(candidate))
+            console.log("[NZWH] Adviser skipped: personal.representedByAdviser is No. Use an adviser scenario to fill this section.");
+          await runPipeline(rest, pipeline.mode, pipeline.barrier);
+          break;
+        }
+      }
+      await sectionBoundary(name);
+      console.log(
+        `[NZWH] Opening section ${selected.indexOf(name) + 1}/${selected.length}: ${name}. url=${await driver.getCurrentUrl().then((u) => new URL(u).pathname).catch(() => "?")}`,
+      );
+      if (adviserSkipped(name)) {
+        console.log(
+          "[NZWH] Adviser skipped: personal.representedByAdviser is No. Use an adviser scenario to fill this section.",
+        );
+        await execution.getStore()?.validations.get(name); // a skipped section still honors its boundary validation
+        continue;
+      }
+      await runSection(name);
+      sequentialDone++;
     }
   }
   await checkpoint();

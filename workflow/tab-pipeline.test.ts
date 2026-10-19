@@ -31,7 +31,7 @@ test("barrier default, valid and invalid", () => {
   expect(snap({ NZWH_PIPELINE_BARRIER: "accepted" }).barrier).toBe("verified");
 });
 
-const tab = (phase: SectionTab["phase"]): SectionTab => ({ name: "personal", phase });
+const tab = (phase: SectionTab["phase"]): SectionTab => ({ name: "personal", handle: "h1", phase });
 function recorder() {
   const events: ExecutionEvent[] = [];
   return { events, emit: async (event: ExecutionEvent) => { events.push(event); } };
