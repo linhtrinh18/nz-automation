@@ -38,6 +38,7 @@ export const runSchema = z
     browserType: z
       .enum(["visible", "profile"])
       .default("visible"),
+    headless: z.boolean().default(false),
     profileName: z
       .string()
       .regex(/^[a-zA-Z0-9_-]{1,60}$/)
@@ -51,6 +52,8 @@ export const runSchema = z
   .strict();
 export type RunInput = z.infer<typeof runSchema>;
 export function validateRun(input: RunInput, requireConsent = true): void {
+  if (input.headless && input.attachPort)
+    throw new Error("Chế độ ẩn không dùng được với Chrome đang mở.");
   if (input.mode === "loginOnly") return;
   if (input.source.kind === "login") throw new Error("Login source requires login-only mode.");
   if (requireConsent && !input.liveSaveConsent)

@@ -89,7 +89,7 @@ export async function chooseBrowser(type: BrowserType, useDefaultAgent = true, p
     } else {
       options.addArguments(`--user-data-dir=${profile}`, "--window-size=1440,1000", "--disable-background-timer-throttling", "--disable-backgrounding-occluded-windows", "--disable-renderer-backgrounding");
       options.detachDriver(true);
-      if (type.includes("headless")) options.addArguments("--headless=new");
+      if (type.includes("headless")) options.addArguments("--headless=new", "--window-size=1920,1080");
       if (!useDefaultAgent) options.addArguments(USER_AGENT);
     }
   }

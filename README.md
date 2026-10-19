@@ -66,7 +66,7 @@ Old browser profile names also lack the app origin; use a fresh profile and sign
 again. Do not copy `.env` or database secrets. Recovery still requires fresh review
 and uncertainty acknowledgement, and blocks changed credentials/application targets.
 
-Each owner has an exclusive run lock. Visible Chrome may stay open for inspection.
+Each owner has an exclusive run lock. Visible Chrome may stay open for inspection. The optional `headless` run flag (default off) runs Chrome without a window; it cannot combine with attach mode, and CAPTCHA can only be solved by 2Captcha, CapSolver or AutoCaptcha.
 Close named profiles before reuse. A machine crash can leave locks or browser processes;
 inspect them before removing a lock. Do not signal unrelated processes.
 

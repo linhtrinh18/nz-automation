@@ -125,6 +125,7 @@ export interface WorkingHolidayOptions {
   scenario?: string;
   allowFictionalDraftSave?: boolean;
   browserType?: "visible" | "profile";
+  headless?: boolean;
   profileName?: string;
   useDefaultAgent?: boolean;
   country?: string;
@@ -1801,10 +1802,14 @@ async function executeWorkingHoliday(
     phase: "browser-starting",
     message: options.attachPort
       ? `Đang kết nối Chrome ở cổng ${options.attachPort}. Bạn có thể bấm Dừng tác vụ bất cứ lúc nào.`
-      : "Đang mở Chrome. Bạn có thể bấm Dừng tác vụ bất cứ lúc nào.",
+      : options.headless
+        ? "Đang mở Chrome ẩn (headless). Bạn có thể bấm Dừng tác vụ bất cứ lúc nào."
+        : "Đang mở Chrome. Bạn có thể bấm Dừng tác vụ bất cứ lúc nào.",
   });
   const driver = await chooseBrowser(
-    options.browserType ?? "visible",
+    options.headless && !options.attachPort
+      ? (options.browserType === "profile" ? "profile-headless" : "headless")
+      : (options.browserType ?? "visible"),
     options.useDefaultAgent ?? true,
     options.profileName,
     options.attachPort,

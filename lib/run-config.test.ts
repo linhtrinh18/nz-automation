@@ -19,6 +19,9 @@ describe("automation safeguards",() => {
   expect(runSchema.safeParse({data,mode:"saveAll",step:"health"}).success).toBe(false);
   expect(runSchema.safeParse({data,mode:"saveAll",firstSection:"health"}).success).toBe(false);
   expect(runSchema.safeParse({data,mode:"saveAll",browserType:"headless"}).success).toBe(false);
+  expect(runSchema.parse({data,mode:"saveAll"}).headless).toBe(false);
+  expect(runSchema.parse({data,mode:"saveAll",headless:true}).headless).toBe(true);
+  expect(() => validateRun(runSchema.parse({data,mode:"saveAll",headless:true,attachPort:9222}))).toThrow("Chế độ ẩn");
  });
  test("scenario overlays preserve metadata, do not mutate source and reject unknown sections",() => {
   const source = {...data,metadata:{keep:[true,"value"]}};

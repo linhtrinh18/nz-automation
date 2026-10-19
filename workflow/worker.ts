@@ -61,7 +61,7 @@ try {
     .catch(() => undefined);
   // Configuration only: no applicant data, credentials or environment values.
   console.log(
-    `[NZWH] run-info id=${basename(directory)} pid=${process.pid} node=${process.version} ${process.platform}/${process.arch} app=${version ?? "?"} mode=${input.mode} source=${input.source.kind} browser=${input.browserType} attachPort=${input.attachPort ?? "-"} country=${input.country ?? "-"} scenario=${input.scenario} sections=${input.sections?.join(",") ?? "all"} resumeKeys=${input.resumeKeys?.length ?? 0}`,
+    `[NZWH] run-info id=${basename(directory)} pid=${process.pid} node=${process.version} ${process.platform}/${process.arch} app=${version ?? "?"} mode=${input.mode} source=${input.source.kind} browser=${input.browserType} headless=${input.headless} attachPort=${input.attachPort ?? "-"} country=${input.country ?? "-"} scenario=${input.scenario} sections=${input.sections?.join(",") ?? "all"} resumeKeys=${input.resumeKeys?.length ?? 0}`,
   );
   await writeFile(
     join(directory, "application.json"),

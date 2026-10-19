@@ -197,7 +197,7 @@ export async function getJob(
     source: buildPlan(input).source,
     browser: input.attachPort
       ? `Chrome đang mở · cổng ${input.attachPort}`
-      : `Chrome có cửa sổ · ${input.browserType.startsWith("profile") ? input.profileName : "hồ sơ tạm"}`,
+      : `${input.headless ? "Chrome ẩn (headless)" : "Chrome có cửa sổ"} · ${input.browserType.startsWith("profile") ? input.profileName : "hồ sơ tạm"}`,
   };
   return {
     ...job,
