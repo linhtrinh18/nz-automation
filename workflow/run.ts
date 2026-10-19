@@ -38,7 +38,6 @@ import { loadTwoCaptchaKey, loadAutoCaptchaKey } from "../server/cloud";
 import { solveRecaptchaV2, CapSolverError } from "./capsolver";
 import { readCaptchaChallenge, applyCaptchaToken, clearCaptchaToken, type CaptchaChallenge } from "./capsolver-browser";
 import { finishApplication, type ApplicationResult } from "./submission";
-import { createVerifyTab, hasVerifyTab, isProtectedWindow, type VerifyOutcome } from "./verify-tab";
 import {
   ACCESS_DENIED_BACKOFF_MS, DEPENDENT_FIELD_TIMEOUT_MS, EARLY_FIELD_WAIT_MS, EARLY_SECTION_WAIT_MS, FAST_POLL_MS, FIELD_WAIT_SLICE_MS,
   MAX_ACCESS_DENIED_RECOVERIES, MAX_FIELD_RESUMES, PAGE_POLL_MS, POSTBACK_WAIT_MS, PRE_SAVE_SETTLE_WAIT_MS, READY_WAIT_MS,
@@ -69,9 +68,7 @@ const reportDirectory = process.env.NZWH_REPORT_DIR ?? directory;
 
 const execution = new AsyncLocalStorage<{
   hooks?: ExecutionHooks;
-  /** Per section: a POST may have landed (never refill). */
-  riskBySection: Map<string, boolean>;
-  currentSection?: string;
+  risk: boolean;
   captchaMode?: "manual" | "capsolver" | "2captcha" | "autocaptcha";
   loadCapSolverKey?: (signal?: AbortSignal) => Promise<string | null>;
   signal?: AbortSignal;
@@ -89,16 +86,12 @@ async function emit(event: ExecutionEvent): Promise<void> {
     sectionMark = undefined;
   }
   if (context && event.type === "persistence" && event.state !== "verified")
-    context.riskBySection.set(context.currentSection ?? "", true);
+    context.risk = true;
   await context?.hooks?.event(event);
 }
 /** Test only: run fn with execution hooks so emitted events can be observed. */
 export function withHooksForTest<T>(hooks: ExecutionHooks, fn: () => Promise<T>, options: { captchaMode?: "manual" | "capsolver" | "2captcha" | "autocaptcha"; signal?: AbortSignal; loadCapSolverKey?: (signal?: AbortSignal) => Promise<string | null> } = {}): Promise<T> {
-  return execution.run({ hooks, riskBySection: new Map(), ...options }, fn);
-}
-/** True when a POST of this section may have been applied in this run attempt. */
-function sectionRisk(name: string): boolean {
-  return execution.getStore()?.riskBySection.get(name) ?? false;
+  return execution.run({ hooks, risk: false, ...options }, fn);
 }
 async function checkpoint(): Promise<void> {
   await execution.getStore()?.hooks?.checkpoint();
@@ -187,29 +180,12 @@ export function captchaTimeoutMinutes(): number {
   const raw = Number(process.env.NZWH_CAPTCHA_TIMEOUT_MINUTES);
   return Number.isInteger(raw) && raw >= 1 && raw <= 240 ? raw : 30;
 }
-/** One CAPTCHA wait per driver at a time (only used while a verify tab is open). */
-const captchaLocks = new WeakMap<WebDriver, Promise<void>>();
 export async function captchaGuard(driver: WebDriver): Promise<boolean> {
-  if (!hasVerifyTab(driver)) return captchaGuardOnce(driver);
-  const previous = captchaLocks.get(driver) ?? Promise.resolve();
-  let release!: () => void;
-  const mine = new Promise<void>(resolve => { release = resolve; });
-  captchaLocks.set(driver, previous.then(() => mine));
-  await previous;
-  try {
-    return await captchaGuardOnce(driver);
-  } finally {
-    release();
-  }
-}
-async function captchaGuardOnce(driver: WebDriver): Promise<boolean> {
   const context = execution.getStore();
   const checkCancelled = () => { if (context?.signal?.aborted) throw new StopRequested(); };
   checkCancelled();
   await assertSiteAvailable(driver);
   if (!(await captchaPending(driver))) return false;
-  // With a verify tab open, the whole wait stays on the window that showed the challenge.
-  const pinned = hasVerifyTab(driver) ? await driver.getWindowHandle() : undefined;
   const notify = async (message: string) => {
     await emit({ type: "captcha", waiting: true, message });
     console.log(`[NZWH] ${message}`);
@@ -276,7 +252,6 @@ async function captchaGuardOnce(driver: WebDriver): Promise<boolean> {
     await driver.wait(
       async () => {
         checkCancelled();
-        if (pinned && (await driver.getWindowHandle()) !== pinned) await driver.switchTo().window(pinned);
         await assertSiteAvailable(driver);
         // A human completion always wins over a pending or late provider result.
         const candidate = await captchaSubmitCandidate(driver);
@@ -575,7 +550,7 @@ export async function selectCountry(driver: WebDriver, code: string): Promise<vo
         await waitWithCaptcha(driver, async () => {
           const handles = await driver.getAllWindowHandles();
           for (const h of handles) {
-            if (h === original || isProtectedWindow(driver, h)) continue;
+            if (h === original) continue;
             // Popup notice: close it and return to the original screen.
             await driver.switchTo().window(h);
             const popupUrl = await driver.getCurrentUrl();
@@ -1573,21 +1548,6 @@ function fastEntrySnapshot(): boolean {
   return true;
 }
 
-/** Hybrid verify-tab snapshot, read once per run (NZWH_PARALLEL_VERIFY=1; default off). */
-function parallelVerifySnapshot(fast: boolean, attach: boolean): boolean {
-  if (process.env.NZWH_PARALLEL_VERIFY !== "1") return false;
-  if (attach) {
-    console.log("[NZWH] Parallel verify unavailable when attaching to Chrome; using sequential verification.");
-    return false;
-  }
-  if (!fast) {
-    console.log("[NZWH] Parallel verify needs fast entry; using sequential verification.");
-    return false;
-  }
-  console.log("[NZWH] Parallel verify enabled (second tab, read-only).");
-  return true;
-}
-
 /** Phase-2 snapshot, read once per run; only meaningful when fast entry is on. */
 function earlyEntrySnapshot(fast: boolean): boolean {
   if (!fast) return false;
@@ -1618,22 +1578,7 @@ function submissionWaitForChange(driver: WebDriver, eagerSession: boolean): (con
 }
 export const submissionWaitForChangeForTest = submissionWaitForChange;
 
-/** Per-run totals for the timing summary (reset at run start). */
-const runTimings = { save: 0, verify: 0, load: 0 };
 const gapText = (gap: number | null) => (gap === null ? "n/a" : String(gap));
-
-/** A section whose SAVE was accepted (path and [errorlabel] checks passed) and awaits verification. */
-interface SavedTicket {
-  name: string;
-  url: string;
-  report: SavedSection;
-  atom: ReturnType<typeof isDisplayedAtomSource>;
-  fillMs: number;
-  saveMs: number;
-  stats: ReturnType<typeof emptyStats>;
-  pageGap: number | null;
-  saveGap: number | null;
-}
 
 async function saveStep(
   driver: WebDriver,
@@ -1641,17 +1586,6 @@ async function saveStep(
   data: ApplicationData,
   mode: EntryMode = LEGACY_ENTRY,
 ): Promise<SavedSection> {
-  const ticket = await saveSection(driver, name, data, mode);
-  return verifySection(driver, ticket, data, mode, { reload: true });
-}
-
-/** Fill, CAPTCHA guard, the single SAVE POST and its server-validation checks. The only SAVE call site. */
-async function saveSection(
-  driver: WebDriver,
-  name: string,
-  data: ApplicationData,
-  mode: EntryMode = LEGACY_ENTRY,
-): Promise<SavedTicket> {
   const fast = mode.fast;
   const report: SavedSection = { filled: [], persisted: [], lookups: [] };
   const url = await driver.getCurrentUrl();
@@ -1705,34 +1639,9 @@ async function saveSection(
     );
   const saveMs = Date.now() - saveStarted;
   await emit({ type: "persistence", state: "accepted" });
-  return { name, url, report, atom, fillMs, saveMs, stats, pageGap, saveGap };
-}
-
-/**
- * Read-only verification of a saved section: reload (GET), same application, batched read, mismatch check.
- * reload false: the current window was already navigated to ticket.url (verify tab); wait for it without
- * activating it. Never posts.
- */
-async function verifySection(
-  driver: WebDriver,
-  ticket: SavedTicket,
-  data: ApplicationData,
-  mode: EntryMode,
-  how: { reload: boolean; overlapMs?: number },
-): Promise<SavedSection> {
-  const { name, url, report, atom, fillMs, saveMs, stats, pageGap, saveGap } = ticket;
   const verifyStarted = Date.now();
-  if (how.reload) {
-    await navigate(driver, url);
-    await waitForSection(driver, name, mode);
-  } else {
-    const id = Object.values(steps[name].fields)[0].id;
-    await waitWithCaptcha(driver, async () => {
-      checkCancelled();
-      await requireSession(driver);
-      return (await documentComplete(driver)) && (await driver.findElements(By.id(id))).length === 1;
-    }, READY_WAIT_MS + SECTION_WAIT_MS, FAST_POLL_MS);
-  }
+  await navigate(driver, url);
+  await waitForSection(driver, name, mode);
   const reloadGap = await readLoadGap(driver);
   const reloaded = new URL(await driver.getCurrentUrl());
   const original = new URL(url);
@@ -1785,14 +1694,11 @@ async function verifySection(
   console.log(`[NZWH] ${name}: saved and verified after reload.`);
   await emit({ type: "persistence", state: "verified" });
   const verifyMs = Date.now() - verifyStarted;
-  runTimings.save += saveMs;
-  runTimings.verify += verifyMs;
-  const overlapped = how.reload ? "" : ` (verify tab, overlapped ${how.overlapMs ?? 0}ms)`;
   console.log(
-    `[NZWH] ${name}: timing fill ${fillMs}ms (fast ${stats.fast}, unchanged ${stats.unchanged}, standard ${stats.standard} in ${stats.standardMs}ms, skipped ${stats.skipped}, segments ${stats.segments}${mode.early ? `, early ${stats.early}, restarts ${stats.restarts}` : ""})${mode.early ? `, settle ${stats.settleMs}ms` : ""}, save ${saveMs}ms, verify ${verifyMs}ms${overlapped}; load gap page ${gapText(pageGap)}/save ${gapText(saveGap)}/reload ${gapText(reloadGap)}ms.`,
+    `[NZWH] ${name}: timing fill ${fillMs}ms (fast ${stats.fast}, unchanged ${stats.unchanged}, standard ${stats.standard} in ${stats.standardMs}ms, skipped ${stats.skipped}, segments ${stats.segments}${mode.early ? `, early ${stats.early}, restarts ${stats.restarts}` : ""})${mode.early ? `, settle ${stats.settleMs}ms` : ""}, save ${saveMs}ms, verify ${verifyMs}ms; load gap page ${gapText(pageGap)}/save ${gapText(saveGap)}/reload ${gapText(reloadGap)}ms.`,
   );
   console.log(
-    `[NZWH] ${name}: SAVE completed; ${report.persisted.length} values persisted and verified. ${how.reload ? "Continuing in the same tab." : "Verified in the verify tab."}`,
+    `[NZWH] ${name}: SAVE completed; ${report.persisted.length} values persisted and verified. Continuing in the same tab.`,
   );
   return report;
 }
@@ -1855,7 +1761,7 @@ export async function fillAndSaveWorkingHolidaySection(
 export async function runWorkingHoliday(
   options: WorkingHolidayOptions,
 ): Promise<AutomationActionResult> {
-  return execution.run({ hooks: options.hooks, riskBySection: new Map(), credentials: options.credentials, captchaMode: options.captchaMode ?? "manual", signal: options.signal }, () =>
+  return execution.run({ hooks: options.hooks, risk: false, credentials: options.credentials, captchaMode: options.captchaMode ?? "manual", signal: options.signal }, () =>
     executeWorkingHoliday(options),
   );
 }
@@ -1981,9 +1887,6 @@ async function executeWorkingHoliday(
     await checkpoint();
     return { success: true, outcome: "loggedIn", message: "Đã đăng nhập thành công. Chrome giữ mở để bạn thao tác; chưa mở hoặc điền hồ sơ.", driver };
   }
-  const parallel = parallelVerifySnapshot(entry.fast, !!options.attachPort);
-  runTimings.save = runTimings.verify = runTimings.load = 0;
-  let verifyFallback: string | null = null;
   let applicationPage: URL | undefined;
   {
     await emit({
@@ -2094,7 +1997,7 @@ async function executeWorkingHoliday(
           if (actual.pathname !== `/WorkingHoliday/Wizard/${steps[name].page}` ||
               actual.searchParams.get("ApplicationId") !== applicationPage?.searchParams.get("ApplicationId"))
             throw new WorkingHolidayStop("Conditional page unavailable or application changed.");
-          if (!sectionRisk(name)) {
+          if (!execution.getStore()?.risk) {
             // Nothing may have been posted: the normal fill starts again on the freshly loaded section.
             await emit({ type: "phase", phase: "section", message: "Đang xử lý mục hồ sơ đã chọn." });
             finish(`refill (attempt ${attempt})`);
@@ -2128,184 +2031,12 @@ async function executeWorkingHoliday(
         }
       }
     };
-    const writeSaved = () => writeFile(join(reportDirectory, "coverage-saved.json"), `${JSON.stringify(saved, null, 2)}\n`);
-    // Section outcomes shared by the sequential loop and the verify tab, so both report identically.
-    const completeSection = async (name: SectionName, report: SavedSection) => {
-      saved[name] = report;
-      completedSections.push(name);
-      await writeSaved();
-      await emit({
-        type: "section-result",
-        status: "completed",
-        detail: "Đã lưu và xác minh sau khi tải lại.",
-        checked:
-          saved[name]?.persisted.length ??
-          Object.keys(steps[name].fields).length,
-        blocked: 0,
-      });
-    };
-    const deniedVerified = async (name: SectionName, keys: string[]) => {
-      saved[name] = { filled: keys, persisted: keys, lookups: [] };
-      completedSections.push(name);
-      await writeSaved();
-      console.log(`[NZWH] ${name}: saved values verified after access-denied redirect; nothing was re-sent.`);
-      await emit({ type: "persistence", state: "verified" });
-      await emit({
-        type: "section-result",
-        status: "completed",
-        detail: "Đã xác minh dữ liệu đã lưu sau khi chuyển hướng; không lưu lại.",
-        checked: keys.length,
-        blocked: 0,
-      });
-    };
-    const deniedUnverified = async (name: SectionName) => {
-      unverifiedSections.push(name);
-      console.log(`[NZWH] ${name}: saved values could not be confirmed after access-denied redirect. No repeat SAVE; continuing to the next selected section.`);
-      await emit({
-        type: "section-result",
-        status: "failed",
-        detail: "Website chuyển hướng đến trang access-denied; chưa xác minh được việc lưu. Không tự lưu lại; tiếp tục mục kế tiếp.",
-      });
-    };
-    const deniedRecoveryFailed = async (name: SectionName, recoveryError: unknown): Promise<never> => {
-      if (recoveryError instanceof StopRequested) throw recoveryError;
-      await emit({
-        type: "section-result",
-        status: "failed",
-        detail: "Không hoàn tất mục này. Kiểm tra Chrome và trạng thái lưu trước khi thử lại.",
-      });
-      throw new WorkingHolidayStop(
-        `Stopped in ${name}. ${recoveryError instanceof WorkingHolidayStop ? recoveryError.message : "Access-denied recovery did not complete. Check the current Chrome page."} Later sections have not run.`,
-      );
-    };
-    const savedButMismatched = async (name: SectionName, error: SavedValueVerificationError) => {
-      // Only raised after a successful reload of the same authenticated section. Do not replay its POST.
-      assertHost(await driver.getCurrentUrl());
-      unverifiedSections.push(name);
-      console.log(`[NZWH] ${error.message} No repeat SAVE; continuing to the next selected section.`);
-      await emit({
-        type: "section-result",
-        status: "failed",
-        detail: `Đã nhận phản hồi lưu nhưng các trường chưa khớp: ${error.fields.join(", ")}. Không tự lưu lại; tiếp tục mục kế tiếp.`,
-        checked: error.checked,
-        blocked: error.fields.length,
-      });
-    };
-    const busySection = async (name: SectionName) => {
-      assertHost(await driver.getCurrentUrl());
-      skippedBusy.push(name);
-      // A busy response cannot establish whether the last POST persisted.
-      delete saved[name];
-      await writeSaved();
-      await writeFile(
-        join(reportDirectory, "coverage-busy.json"),
-        `${JSON.stringify({ skippedUnverified: skippedBusy }, null, 2)}\n`,
-      );
-      await emit({
-        type: "section-result",
-        status: "failed",
-        detail:
-          "Trang đích bận. Chưa xác minh việc lưu; không tự thử lại. Các mục tiếp theo vẫn được xử lý.",
-      });
-      console.log(
-        `[NZWH] ${name}: site returned Please try again later. Save state is unverified; moving to the next form section in this same tab.`,
-      );
-    };
-    const failStop = async (name: SectionName, error: unknown): Promise<never> => {
-      await emit({
-        type: "section-result",
-        status: "failed",
-        detail:
-          "Không hoàn tất mục này. Kiểm tra Chrome và trạng thái lưu trước khi thử lại.",
-      });
-      const reason =
-        error instanceof WorkingHolidayStop
-          ? error.message
-          : "Form interaction or page load did not complete. Check the current Chrome page.";
-      throw new WorkingHolidayStop(
-        `Stopped in ${name}. ${reason} Later sections have not run.`,
-      );
-    };
-    const sectionUrl = (name: SectionName) =>
-      `${origin}/WorkingHoliday/Wizard/${steps[name].page}?${applicationPage?.searchParams.toString()}`;
-    const savedRiskStop = "Phiên đăng nhập hết hạn sau thao tác có thể lưu dữ liệu. Không tự điền lại. Kiểm tra dữ liệu trên Chrome rồi khôi phục có xác nhận.";
-    /**
-     * A deferred verification of a section whose SAVE was accepted (risk true) failed: the same outcome as the
-     * sequential catch for that error. Never refills and never re-sends SAVE.
-     */
-    const savedVerifyFailed = async (name: SectionName, error: unknown): Promise<void> => {
-      if (error instanceof StopRequested) throw error;
-      if (error instanceof SavedValueVerificationError) return savedButMismatched(name, error);
-      if (error instanceof SiteBusyError) return busySection(name);
-      if (error instanceof AccessDeniedError) {
-        checkCancelled();
-        let result: DeniedOutcome;
-        try {
-          result = await recoverFromAccessDenied(name);
-        } catch (recoveryError) {
-          return deniedRecoveryFailed(name, recoveryError);
-        }
-        if (result.outcome === "verified") return deniedVerified(name, result.keys);
-        if (result.outcome === "unverified") return deniedUnverified(name);
-        // risk is true for this section, so "retry" cannot occur; a login form means the session ended after SAVE.
-        throw new WorkingHolidayStop(savedRiskStop);
-      }
-      const state = await readAuthState(driver);
-      if (state.rejected) throw new WorkingHolidayStop(loginRejectedMessage);
-      if (error instanceof SessionExpiredError || state.loginForm) throw new WorkingHolidayStop(savedRiskStop);
-      return failStop(name, error);
-    };
-    const tickets = new Map<string, SavedTicket>();
-    const verifyTab = parallel
-      ? createVerifyTab<SavedSection>(driver, {
-          verify: item => verifySection(driver, tickets.get(item.name)!, data, entry, { reload: false, overlapMs: Date.now() - item.startedAt }),
-          fallbackReason: error =>
-            error instanceof SiteBusyError ? "site busy"
-            : error instanceof AccessDeniedError ? "access denied"
-            : error instanceof SessionExpiredError || (error instanceof WorkingHolidayStop && error.message === loginRejectedMessage) ? "session problem"
-            : error instanceof webdriverError.TimeoutError ? "verify tab load timeout"
-            : isNavigationError(error) ? "verify tab navigation error"
-            : null,
-          log: message => console.log(message),
-        })
-      : undefined;
-    /** Resolves the pending verify-tab item; a fallback re-verifies in the main tab with a GET (never a POST). */
-    const settleVerify = async () => {
-      const outcome: VerifyOutcome<SavedSection> | null | undefined = await verifyTab?.settle();
-      if (!outcome) return;
-      const name = outcome.name as SectionName;
-      console.log(`[NZWH] ${name}: verify tab ${outcome.outcome} after ${outcome.verifyMs}ms (overlapped ${outcome.overlapMs}ms).`);
-      if (outcome.outcome === "verified") return completeSection(name, outcome.result);
-      if (outcome.outcome === "unverified") return savedButMismatched(name, outcome.error);
-      if (outcome.outcome === "error") return savedVerifyFailed(name, outcome.error);
-      try {
-        await completeSection(name, await verifySection(driver, tickets.get(name)!, data, entry, { reload: true }));
-      } catch (error) {
-        await savedVerifyFailed(name, error);
-      }
-    };
-    try {
     for (const [sectionIndex, name] of selected.entries()) {
       if (
         options.taskKeys &&
         !options.taskKeys.includes(`${scenario}:${name}`)
       )
         continue;
-      if (verifyTab?.pending && !(name === "adviser" && data.personal.representedByAdviser !== "Yes")) {
-        // Load this section in the main tab while the previous one reloads in the verify tab, then settle it
-        // before this section starts (its events stay attributed to the previous section).
-        const loadStarted = Date.now();
-        try {
-          await navigate(driver, sectionUrl(name));
-        } catch (error) {
-          // The loop below re-navigates and runs every page check; nothing was posted.
-          if (error instanceof StopRequested) throw error;
-        }
-        const loadMs = Date.now() - loadStarted;
-        runTimings.load += loadMs;
-        console.log(`[NZWH] ${name}: timing next-load ${loadMs}ms (main tab, overlapping verify).`);
-        await settleVerify();
-      }
       await checkpoint();
       console.log(
         `[NZWH] Opening section ${sectionIndex + 1}/${selected.length}: ${name}. url=${await driver.getCurrentUrl().then((u) => new URL(u).pathname).catch(() => "?")}`,
@@ -2317,10 +2048,7 @@ async function executeWorkingHoliday(
         continue;
       }
       const context = execution.getStore();
-      if (context) {
-        context.currentSection = name;
-        context.riskBySection.set(name, false);
-      }
+      if (context) context.risk = false;
       await emit({
         type: "section-start",
         section: name,
@@ -2329,12 +2057,10 @@ async function executeWorkingHoliday(
       let recoveredSession = false;
       while (true) {
         try {
-          const url = sectionUrl(name);
-          const loadStarted = Date.now();
+          const url = `${origin}/WorkingHoliday/Wizard/${steps[name].page}?${applicationPage?.searchParams.toString()}`;
           if ((await driver.getCurrentUrl()) !== url)
             await navigate(driver, url);
           await waitForSection(driver, name, entry);
-          runTimings.load += Date.now() - loadStarted;
           const actual = new URL(await driver.getCurrentUrl());
           assertHost(actual.href);
           if (
@@ -2345,15 +2071,21 @@ async function executeWorkingHoliday(
             throw new WorkingHolidayStop(
               "Conditional page unavailable or application changed.",
             );
-          if (verifyTab?.enabled) {
-            const ticket = await saveSection(driver, name, data, entry);
-            tickets.set(name, ticket);
-            // Verification continues in the verify tab; its result is reported before the next section starts.
-            if (await verifyTab.start({ name, url: ticket.url })) break;
-            await completeSection(name, await verifySection(driver, ticket, data, entry, { reload: true }));
-            break;
-          }
-          await completeSection(name, await saveStep(driver, name, data, entry));
+          saved[name] = await saveStep(driver, name, data, entry);
+          completedSections.push(name);
+          await writeFile(
+            join(reportDirectory, "coverage-saved.json"),
+            `${JSON.stringify(saved, null, 2)}\n`,
+          );
+          await emit({
+            type: "section-result",
+            status: "completed",
+            detail: "Đã lưu và xác minh sau khi tải lại.",
+            checked:
+              saved[name]?.persisted.length ??
+              Object.keys(steps[name].fields).length,
+            blocked: 0,
+          });
           break;
         } catch (caught) {
           let error: unknown = caught;
@@ -2364,15 +2096,43 @@ async function executeWorkingHoliday(
             try {
               result = await recoverFromAccessDenied(name);
             } catch (recoveryError) {
-              return deniedRecoveryFailed(name, recoveryError);
+              if (recoveryError instanceof StopRequested) throw recoveryError;
+              await emit({
+                type: "section-result",
+                status: "failed",
+                detail: "Không hoàn tất mục này. Kiểm tra Chrome và trạng thái lưu trước khi thử lại.",
+              });
+              throw new WorkingHolidayStop(
+                `Stopped in ${name}. ${recoveryError instanceof WorkingHolidayStop ? recoveryError.message : "Access-denied recovery did not complete. Check the current Chrome page."} Later sections have not run.`,
+              );
             }
             if (result.outcome === "retry") continue;
             if (result.outcome === "verified") {
-              await deniedVerified(name, result.keys);
+              saved[name] = { filled: result.keys, persisted: result.keys, lookups: [] };
+              completedSections.push(name);
+              await writeFile(
+                join(reportDirectory, "coverage-saved.json"),
+                `${JSON.stringify(saved, null, 2)}\n`,
+              );
+              console.log(`[NZWH] ${name}: saved values verified after access-denied redirect; nothing was re-sent.`);
+              await emit({ type: "persistence", state: "verified" });
+              await emit({
+                type: "section-result",
+                status: "completed",
+                detail: "Đã xác minh dữ liệu đã lưu sau khi chuyển hướng; không lưu lại.",
+                checked: result.keys.length,
+                blocked: 0,
+              });
               break;
             }
             if (result.outcome === "unverified") {
-              await deniedUnverified(name);
+              unverifiedSections.push(name);
+              console.log(`[NZWH] ${name}: saved values could not be confirmed after access-denied redirect. No repeat SAVE; continuing to the next selected section.`);
+              await emit({
+                type: "section-result",
+                status: "failed",
+                detail: "Website chuyển hướng đến trang access-denied; chưa xác minh được việc lưu. Không tự lưu lại; tiếp tục mục kế tiếp.",
+              });
               break;
             }
             // Login form after the redirect: reuse the one-shot re-authentication path below.
@@ -2383,8 +2143,10 @@ async function executeWorkingHoliday(
             if (state.rejected)
               throw new WorkingHolidayStop(loginRejectedMessage);
             if (error instanceof SessionExpiredError || state.loginForm) {
-              if (sectionRisk(name))
-                throw new WorkingHolidayStop(savedRiskStop);
+              if (execution.getStore()?.risk)
+                throw new WorkingHolidayStop(
+                  "Phiên đăng nhập hết hạn sau thao tác có thể lưu dữ liệu. Không tự điền lại. Kiểm tra dữ liệu trên Chrome rồi khôi phục có xác nhận.",
+                );
               if (recoveredSession)
                 throw new WorkingHolidayStop(
                   `Session expired again in ${name}; stopped after one recovery attempt.`,
@@ -2431,27 +2193,61 @@ async function executeWorkingHoliday(
             break;
           }
           if (error instanceof SavedValueVerificationError) {
-            await savedButMismatched(name, error);
+            // saveStep only raises this after a successful reload of the same
+            // authenticated section. Do not replay its POST; process the rest.
+            assertHost(await driver.getCurrentUrl());
+            unverifiedSections.push(name);
+            console.log(`[NZWH] ${error.message} No repeat SAVE; continuing to the next selected section.`);
+            await emit({
+              type: "section-result",
+              status: "failed",
+              detail: `Đã nhận phản hồi lưu nhưng các trường chưa khớp: ${error.fields.join(", ")}. Không tự lưu lại; tiếp tục mục kế tiếp.`,
+              checked: error.checked,
+              blocked: error.fields.length,
+            });
             break;
           }
           if (error instanceof SiteBusyError) {
-            await busySection(name);
+            assertHost(await driver.getCurrentUrl());
+            skippedBusy.push(name);
+            // A busy response cannot establish whether the last POST persisted.
+            delete saved[name];
+            await writeFile(
+              join(reportDirectory, "coverage-saved.json"),
+              `${JSON.stringify(saved, null, 2)}\n`,
+            );
+            await writeFile(
+              join(reportDirectory, "coverage-busy.json"),
+              `${JSON.stringify({ skippedUnverified: skippedBusy }, null, 2)}\n`,
+            );
+            await emit({
+              type: "section-result",
+              status: "failed",
+              detail:
+                "Trang đích bận. Chưa xác minh việc lưu; không tự thử lại. Các mục tiếp theo vẫn được xử lý.",
+            });
+            console.log(
+              `[NZWH] ${name}: site returned Please try again later. Save state is unverified; moving to the next form section in this same tab.`,
+            );
             break;
           }
-          return failStop(name, error);
+          await emit({
+            type: "section-result",
+            status: "failed",
+            detail:
+              "Không hoàn tất mục này. Kiểm tra Chrome và trạng thái lưu trước khi thử lại.",
+          });
+          const reason =
+            error instanceof WorkingHolidayStop
+              ? error.message
+              : "Form interaction or page load did not complete. Check the current Chrome page.";
+          throw new WorkingHolidayStop(
+            `Stopped in ${name}. ${reason} Later sections have not run.`,
+          );
         }
       }
     }
-    // Every deferred verification is resolved and reported before submission is considered.
-    await settleVerify();
-    } finally {
-      verifyFallback = verifyTab?.reason ?? null;
-      await verifyTab?.close().catch(() => undefined);
-    }
   }
-  console.log(
-    `[NZWH] Timing summary mode=${parallel ? "parallel" : "sequential"}: save ${runTimings.save}ms, verify ${runTimings.verify}ms, load ${runTimings.load}ms, fallback=${verifyFallback ?? "none"}.`,
-  );
   await checkpoint();
   console.log(
     `[NZWH] Sections saved and verified this run: ${completedSections.join(", ") || "none"}.`,
