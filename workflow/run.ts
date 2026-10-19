@@ -20,10 +20,10 @@ import { chooseBrowser } from "../browser/chooseBrowser";
 import { pipelineSnapshot } from "./tab-pipeline";
 import { windowSizedAtLaunch } from "../browser/window-size";
 
-import { readAuthState } from "./auth-state";
+import { AUTH_STATE_JS, readAuthState } from "./auth-state";
 import { applicationDataSchema as dataSchema } from "./application-data";
 import {
-  ACCESS_DENIED_DISABLED_MESSAGE, ACCESS_DENIED_GIVE_UP_MESSAGE, ACCESS_DENIED_LOG_PATH, AccessDeniedError,
+  ACCESS_DENIED_DISABLED_MESSAGE, ACCESS_DENIED_GIVE_UP_MESSAGE, ACCESS_DENIED_LOG_PATH, AccessDeniedError, SITE_STATE_JS,
   abortableBackoff, assertSiteAvailable, isAccessDenied, SiteBusyError,
 } from "./site-busy";
 import { occupationLookups, steps } from "./fields";
@@ -31,7 +31,7 @@ import type { OccupationLookup } from "./fields";
 import { lookupTimeoutMs, pickResult, queryPlan } from "./occupation-match";
 import { applicable } from "./conditions";
 import { expectedFieldValue, savedValueDiagnostic } from "./saved-values";
-import { classifyPage, type PageState } from "./page-state";
+import { buildPageProbeScript, classifyPage, parsePageProbe, type PageProbe, type PageState } from "./page-state";
 import { loadCapSolverKey } from "../server/cloud";
 import { solveRecaptchaV2 as solveTwoCaptcha, TwoCaptchaError, formatDuration } from "./two-captcha";
 import { quiet } from "../lib/log-stamp";
@@ -70,30 +70,58 @@ const reportDirectory = process.env.NZWH_REPORT_DIR ?? directory;
 
 const execution = new AsyncLocalStorage<{
   hooks?: ExecutionHooks;
-  risk: boolean;
+  /** Per-section "a SAVE may have been sent" flag; sections can be in flight in two tabs at once. */
+  riskBySection: Map<string, boolean>;
+  /** Foreground section: events without an explicit section belong to it. */
+  currentSection?: string;
+  /** True while the tab pipeline is active: keyed events must name their section. */
+  pipelineActive?: boolean;
+  /** Credential validation started at a section boundary, awaited right before that section's own SAVE. */
+  validations: Map<string, Promise<void>>;
   captchaMode?: "manual" | "capsolver" | "2captcha" | "autocaptcha";
   loadCapSolverKey?: (signal?: AbortSignal) => Promise<string | null>;
   signal?: AbortSignal;
   credentials?: { username: string; password: string };
 }>();
 let runStartMs = Date.now();
-let sectionMark: { name: string; startMs: number } | undefined;
+const sectionMarks = new Map<string, number>();
+const newStore = () => ({ riskBySection: new Map<string, boolean>(), validations: new Map<string, Promise<void>>() });
+/** True when a SAVE for this section may have reached the server. */
+function sectionRisk(name: string | undefined): boolean {
+  return execution.getStore()?.riskBySection.get(name ?? "") ?? false;
+}
 async function emit(event: ExecutionEvent): Promise<void> {
   const context = execution.getStore();
+  let routed = event;
   if (event.type === "section-start") {
-    sectionMark = { name: event.section, startMs: Date.now() };
+    sectionMarks.set(event.section, Date.now());
+    if (context && !context.pipelineActive) context.currentSection = event.section;
     console.log(`[NZWH] Section ${event.section} started.`);
-  } else if (event.type === "section-result" && sectionMark) {
-    console.log(`[NZWH] Section ${sectionMark.name} ${event.status} in ${formatDuration(Date.now() - sectionMark.startMs)}.`);
-    sectionMark = undefined;
+  } else if (event.type === "persistence" || event.type === "section-result" || event.type === "captcha") {
+    const section = event.section ?? context?.currentSection;
+    if (context?.pipelineActive) {
+      // Background steps must name their section; foreground code is keyed by the foreground section.
+      if (!event.section && event.background) {
+        console.error("[NZWH] Pipeline event without a section was dropped.");
+        return;
+      }
+      if (!event.section && section) routed = { ...event, section: section as SectionName };
+    }
+    if (event.type === "section-result") {
+      const started = section ? sectionMarks.get(section) : undefined;
+      if (section && started !== undefined) {
+        console.log(`[NZWH] Section ${section} ${event.status} in ${formatDuration(Date.now() - started)}.`);
+        sectionMarks.delete(section);
+      }
+    }
+    if (context && event.type === "persistence" && event.state !== "verified")
+      context.riskBySection.set(section ?? "", true);
   }
-  if (context && event.type === "persistence" && event.state !== "verified")
-    context.risk = true;
-  await context?.hooks?.event(event);
+  await context?.hooks?.event(routed);
 }
 /** Test only: run fn with execution hooks so emitted events can be observed. */
 export function withHooksForTest<T>(hooks: ExecutionHooks, fn: () => Promise<T>, options: { captchaMode?: "manual" | "capsolver" | "2captcha" | "autocaptcha"; signal?: AbortSignal; loadCapSolverKey?: (signal?: AbortSignal) => Promise<string | null> } = {}): Promise<T> {
-  return execution.run({ hooks, risk: false, ...options }, fn);
+  return execution.run({ hooks, ...newStore(), ...options }, fn);
 }
 async function checkpoint(): Promise<void> {
   await execution.getStore()?.hooks?.checkpoint();
@@ -133,14 +161,20 @@ export interface WorkingHolidayOptions {
   country?: string;
 }
 
-export async function captchaPending(driver: WebDriver): Promise<boolean> {
-  return driver.executeScript<boolean>(`
+const CAPTCHA_PENDING_JS = `
     const challengePage = /captcha/i.test(location.pathname) || /please complete the captcha/i.test(document.body?.innerText || '');
     const widgets = Array.from(document.querySelectorAll('iframe[src*="recaptcha"],iframe[src*="hcaptcha"],input[id*="captcha"],img[src*="captcha"]'))
       .some(e => e.getBoundingClientRect().width > 0 && e.getBoundingClientRect().height > 0);
     const completed = Array.from(document.querySelectorAll('textarea[name="g-recaptcha-response"],textarea[name="h-captcha-response"],input[name="h-captcha-response"]')).some(e => e.value.trim().length > 0);
     return challengePage || (widgets && !completed);
-  `);
+  `;
+export async function captchaPending(driver: WebDriver): Promise<boolean> {
+  return driver.executeScript<boolean>(CAPTCHA_PENDING_JS);
+}
+/** E2: one round trip for site state + CAPTCHA + auth (local names renamed so single-purpose script matchers ignore it). */
+const PAGE_PROBE_JS = buildPageProbeScript({ site: SITE_STATE_JS, captcha: CAPTCHA_PENDING_JS.replaceAll("challengePage", "probeChallenge"), auth: AUTH_STATE_JS });
+async function readPageProbe(driver: WebDriver): Promise<PageProbe | null> {
+  return parsePageProbe(await driver.executeScript<unknown>(PAGE_PROBE_JS));
 }
 
 /** Only the dedicated CAPTCHA form may be submitted after a response is present. */
@@ -354,7 +388,10 @@ export async function waitWithCaptcha<T>(
   let deadline = Date.now() + timeout;
   while (true) {
     const before = Date.now();
-    if (await captchaGuard(driver)) deadline += Date.now() - before;
+    // Common case: one probe says the page is available and has no CAPTCHA; otherwise the full guard decides.
+    const probe = await readPageProbe(driver);
+    if (probe && !probe.site && !probe.captcha) checkCancelled();
+    else if (await captchaGuard(driver)) deadline += Date.now() - before;
     const value = await condition();
     if (value) return value as NonNullable<T>;
     if (Date.now() >= deadline)
@@ -407,6 +444,15 @@ async function navigate(driver: WebDriver, url: string): Promise<void> {
   }
 }
 
+const HOME_LANDMARKS = 'a[href*="Logout"],a[href*="Login"],input[name="username"],a[id*="editHyperLink"],a[href*="CountryId="]';
+/** Waits for any landmark of the page that follows a navigation, or full load, whichever comes first (legacy: full load). */
+async function settleNavigation(driver: WebDriver, landmarks: string): Promise<void> {
+  if (!earlyFillEnabled()) return ready(driver);
+  await waitWithCaptcha(driver, async () =>
+    (await driver.findElements(By.css(landmarks))).length > 0 ||
+    (await driver.executeScript<string>("return document.readyState")) === "complete",
+  READY_WAIT_MS, FAST_POLL_MS);
+}
 async function authenticate(
   driver: WebDriver,
   acceptCountryGrid = false,
@@ -427,8 +473,10 @@ async function authenticate(
   console.log(
     "[NZWH] Starting a fresh login before opening any applicant fields.",
   );
+  // E4: targeted waits replace the blanket load wait; NZWH_EARLY_FILL=0 keeps the legacy ready() calls.
+  const quick = earlyFillEnabled();
   await navigate(driver, home);
-  await ready(driver);
+  await settleNavigation(driver, HOME_LANDMARKS);
   const logoutLinks = await driver.findElements(By.css('a[href*="Logout"]'));
   if (logoutLinks.length) {
     const logoutUrl = await logoutLinks[0].getAttribute("href");
@@ -436,11 +484,11 @@ async function authenticate(
       throw new WorkingHolidayStop("Logout link is missing its destination.");
     assertHost(logoutUrl);
     await navigate(driver, logoutUrl);
-    await ready(driver);
+    if (!quick) await ready(driver);
     console.log("[NZWH] Previous session signed out.");
   }
   await navigate(driver, login);
-  await ready(driver);
+  if (!quick) await ready(driver);
   await waitWithCaptcha(driver, async () => {
     return (
       (await driver.findElements(By.css('input[name="username"]'))).length === 1
@@ -472,10 +520,10 @@ async function authenticate(
     if (state.rejected) throw new WorkingHolidayStop(loginRejectedMessage);
     return state.authenticated;
   }, 30000);
-  await ready(driver);
+  if (!quick || loginOnly) await ready(driver);
   if (loginOnly) return;
   await navigate(driver, home);
-  await ready(driver);
+  if (!quick) await ready(driver);
   await waitWithCaptcha(driver,
     async () =>
       (await driver.findElements(By.css('a[id*="editHyperLink"]'))).length > 0 ||
@@ -525,7 +573,7 @@ export async function selectCountry(driver: WebDriver, code: string): Promise<vo
     await requireSession(driver);
     if (!new URL(await driver.getCurrentUrl()).pathname.match(/^\/WorkingHoliday\/?$/i)) {
       await navigate(driver, home);
-      await ready(driver);
+      if (!earlyFillEnabled()) await ready(driver);
     }
     await waitWithCaptcha(driver, async () => (await countryTiles(driver)).length > 0, 20000);
     const tile = matchTile(await countryTiles(driver), country);
@@ -546,7 +594,14 @@ export async function selectCountry(driver: WebDriver, code: string): Promise<vo
         "arguments[0].scrollIntoView({block:'center'})",
         target,
       );
-      await driver.sleep(300);
+      // E8: wait for the tile to be in view instead of a fixed 300 ms sleep; fall through to the click on timeout.
+      try {
+        await waitWithCaptcha(driver, () => driver.executeScript<boolean>(
+          "const r = arguments[0].getBoundingClientRect(); return r.bottom > 0 && r.top < window.innerHeight;", target),
+        2000, FAST_POLL_MS);
+      } catch (error) {
+        if (!(error instanceof webdriverError.TimeoutError)) throw error;
+      }
       const original = await driver.getWindowHandle();
       await clickWithFallback(driver, target);
       try {
@@ -595,7 +650,7 @@ export async function selectCountry(driver: WebDriver, code: string): Promise<vo
       await new Promise((resolve) => setTimeout(resolve, 200));
     }
     await navigate(driver, home);
-    await ready(driver);
+    if (!earlyFillEnabled()) await ready(driver);
   }
 }
 
@@ -768,7 +823,8 @@ const LEGACY_ENTRY: EntryMode = { fast: false, early: false };
 async function waitForSection(driver: WebDriver, name: string, mode: EntryMode = LEGACY_ENTRY): Promise<void> {
   const id = Object.values(steps[name].fields)[0].id;
   const pollMs = mode.fast ? FAST_POLL_MS : PAGE_POLL_MS;
-  await activateChrome(driver);
+  // E7: fast entry activates the tab only before native input; legacy entry keeps the per-section activation.
+  if (!mode.fast) await activateChrome(driver);
   if (mode.early) {
     // DOM-ready entry: no ready(); one wait keeps the READY_WAIT_MS + SECTION_WAIT_MS budget.
     await waitWithCaptcha(driver, async () => {
@@ -900,6 +956,7 @@ async function postbackAndWait(
   trigger: WebElement,
   name: string,
   fast = false,
+  level: PostbackLevel = "complete",
 ): Promise<void> {
   const stamp = await driver.executeScript<number>(
     "return performance.timeOrigin",
@@ -909,7 +966,7 @@ async function postbackAndWait(
   await emit({ type: "persistence", state: "possible" });
   await trigger.sendKeys(Key.SPACE);
   try {
-    await waitForPostback(driver, name, stamp, fast);
+    await waitForPostback(driver, name, stamp, fast, level);
   } catch (error) {
     if (error instanceof Error && error.name === "TimeoutError") {
       // A timeout on the access-denied page is a redirect, not an unverified postback on our section.
@@ -920,26 +977,28 @@ async function postbackAndWait(
   }
 }
 
+/** "interactive": DOM-ready is enough (pipeline SAVE response); "complete": full load (today). */
+type PostbackLevel = "complete" | "interactive";
 async function waitForPostback(
   driver: WebDriver,
   name: string,
   stamp: number,
   fast = false,
+  level: PostbackLevel = "complete",
 ): Promise<void> {
   await waitWithCaptcha(driver, async () => {
     await requireSession(driver);
     return driver.executeScript<boolean>(
       `
       const manager = typeof Sys !== 'undefined' && Sys.WebForms && Sys.WebForms.PageRequestManager ? Sys.WebForms.PageRequestManager.getInstance() : null;
-      return performance.timeOrigin !== arguments[1] && document.readyState === 'complete' && !(manager && manager.get_isInAsyncPostBack()) && (typeof jQuery === 'undefined' || jQuery.active === 0) && !!document.getElementById(arguments[0]);
+      return performance.timeOrigin !== arguments[1] && document.readyState ${level === 'interactive' ? "!== 'loading'" : "=== 'complete'"} && !(manager && manager.get_isInAsyncPostBack()) && (typeof jQuery === 'undefined' || jQuery.active === 0) && !!document.getElementById(arguments[0]);
     `,
       Object.values(steps[name].fields)[0].id,
       stamp,
     );
   }, POSTBACK_WAIT_MS, fast ? FAST_POLL_MS : PAGE_POLL_MS);
-  // The predicate already proved a new complete document with the first field present.
-  if (fast) await activateChrome(driver);
-  else await waitForSection(driver, name);
+  // The predicate already proved a new document with the first field present (fast); legacy re-waits.
+  if (!fast) await waitForSection(driver, name);
 }
 
 const selectionMatches = (label: string, expected: string): boolean =>
@@ -1204,6 +1263,7 @@ async function legacyFillField(
     : 0;
   if (posts && current !== expected)
     await emit({ type: "persistence", state: "possible" });
+  if (fast) await activateChrome(driver); // E7: native input needs the active tab
   await setField(driver, field, expected, element);
   // Reselect matching values too. Same-value selections may not emit change,
   // so only require a postback when the underlying value actually changes.
@@ -1583,12 +1643,62 @@ export const submissionWaitForChangeForTest = submissionWaitForChange;
 
 const gapText = (gap: number | null) => (gap === null ? "n/a" : String(gap));
 
-async function saveStep(
+const SAVE_BUTTON_ID = "ContentPlaceHolder1_wizardPageFooter_wizardPageNavigator_validateButton";
+/** E6: unmapped-field check, current URL and SAVE-control choice in one round trip (SAVE only; SUBMIT footers use sectionSaveControl). */
+const PRE_SAVE_JS = `
+    const mapped = new Set(arguments[0]);
+    const unmapped = Array.from(document.querySelectorAll('input,select,textarea')).filter(e => {
+      if (!e.id.startsWith('ContentPlaceHolder1_') || mapped.has(e.id) || ['hidden','submit','image','button'].includes(e.type)) return false;
+      const visible = e.getBoundingClientRect().width > 0 || !!document.querySelector('#s2id_' + e.id);
+      return visible && !e.disabled;
+    }).map(e => e.id);
+    const save = document.getElementById(arguments[1]);
+    const shown = !!save && save.getBoundingClientRect().width > 0 && save.getBoundingClientRect().height > 0 && getComputedStyle(save).visibility !== 'hidden';
+    return { nzwhPreSave: 1, unmapped, href: location.href, saveId: shown && !save.disabled ? save.id : null };
+  `;
+interface PreSave { unmapped: string[]; href: string | null; saveId: string | null }
+/** Accepts the combined answer, or the legacy bare unmapped list (older fakes); anything else is rejected. */
+export function parsePreSave(raw: unknown): PreSave | null {
+  if (Array.isArray(raw)) return { unmapped: raw.map(String), href: null, saveId: null };
+  if (typeof raw !== "object" || raw === null) return null;
+  const value = raw as Record<string, unknown>;
+  if (value.nzwhPreSave !== 1 || !Array.isArray(value.unmapped)) return null;
+  return {
+    unmapped: value.unmapped.map(String),
+    href: typeof value.href === "string" ? value.href : null,
+    saveId: typeof value.saveId === "string" ? value.saveId : null,
+  };
+}
+
+/** Everything the reload verification needs from the fill+SAVE half of a section. */
+interface SavedTicket {
+  name: string;
+  url: string;
+  report: SavedSection;
+  atom: string | null;
+  mode: EntryMode;
+  verifyKeys: string[];
+  stats: FillStats;
+  fillMs: number;
+  saveMs: number;
+  pageGap: number | null;
+  saveGap: number | null;
+}
+interface SaveSectionOptions {
+  /** Pipeline only: runs after the pre-SAVE check passed and right before the SAVE click (barrier + prefetch). */
+  beforePost?: () => Promise<void>;
+  /** Pipeline only: accept the SAVE response at DOM-ready and leave `persistence accepted` to the load-time re-scan. */
+  interactive?: boolean;
+}
+
+/** Fill, pre-SAVE check, the single SAVE call site and the DOM-ready response checks. */
+async function saveSection(
   driver: WebDriver,
   name: string,
   data: ApplicationData,
   mode: EntryMode = LEGACY_ENTRY,
-): Promise<SavedSection> {
+  options: SaveSectionOptions = {},
+): Promise<SavedTicket> {
   const fast = mode.fast;
   const report: SavedSection = { filled: [], persisted: [], lookups: [] };
   const url = await driver.getCurrentUrl();
@@ -1607,43 +1717,56 @@ async function saveStep(
   const fillMs = Date.now() - fillStarted;
   if (name === "occupation")
     report.lookups = await occupationSelection(driver, data);
-  const unmapped = await driver.executeScript<string[]>(
-    `
-    const mapped = new Set(arguments[0]);
-    return Array.from(document.querySelectorAll('input,select,textarea')).filter(e => {
-      if (!e.id.startsWith('ContentPlaceHolder1_') || mapped.has(e.id) || ['hidden','submit','image','button'].includes(e.type)) return false;
-      const visible = e.getBoundingClientRect().width > 0 || !!document.querySelector('#s2id_' + e.id);
-      return visible && !e.disabled;
-    }).map(e => e.id);
-  `,
+  const combined = parsePreSave(await driver.executeScript<unknown>(
+    PRE_SAVE_JS,
     Object.values(steps[name].fields).map((field) => field.id),
-  );
-  if (unmapped.length)
+    SAVE_BUTTON_ID,
+  ));
+  if (!combined) throw new WorkingHolidayStop("Unexpected page state before SAVE.");
+  if (combined.unmapped.length)
     throw new WorkingHolidayStop(
-      `Additional ${name} branch fields need mapping before SAVE: ${unmapped.join(", ")}.`,
+      `Additional ${name} branch fields need mapping before SAVE: ${combined.unmapped.join(", ")}.`,
     );
-  await captchaGuard(driver);
-  if ((await driver.getCurrentUrl()) !== url)
+  await options.beforePost?.();
+  // Credential validation started at this section's boundary must pass before its own CAPTCHA/SAVE.
+  await execution.getStore()?.validations.get(name);
+  const guarded = await captchaGuard(driver);
+  // A solved CAPTCHA may have changed the page: re-read the URL and the SAVE control the long way.
+  const href = combined.href !== null && !guarded ? combined.href : await driver.getCurrentUrl();
+  if (href !== url)
     throw new WorkingHolidayStop("Unexpected navigation before SAVE.");
-  const save = await sectionSaveControl(driver, name);
+  const save = combined.saveId && !guarded
+    ? await driver.findElement(By.id(combined.saveId))
+    : await sectionSaveControl(driver, name);
   const saveStarted = Date.now();
-  await postbackAndWait(driver, save, name, fast);
+  await postbackAndWait(driver, save, name, fast, options.interactive ? "interactive" : "complete");
   const saveGap = await readLoadGap(driver);
   if (new URL(await driver.getCurrentUrl()).pathname !== new URL(url).pathname)
     throw new WorkingHolidayStop(
       "SAVE navigated outside the inspected section; stopped.",
     );
-  const invalid = await driver.executeScript<number>(`
-    return Array.from(document.querySelectorAll('[errorlabel]')).filter(e => /mandatory|invalid|error/i.test(e.getAttribute('errorlabel') || '') && e.getBoundingClientRect().width > 0).length;
-  `);
+  const invalid = await driver.executeScript<number>(ERROR_LABEL_SCAN_JS);
   if (invalid)
     throw new WorkingHolidayStop(
       `Server validation flagged ${invalid} fields in ${name}; stopped before next section.`,
     );
   const saveMs = Date.now() - saveStarted;
-  await emit({ type: "persistence", state: "accepted" });
+  // Pipeline: acceptance waits for the load-time re-scan (tab-pipeline.loadTimeRescan).
+  if (!options.interactive) await emit({ type: "persistence", state: "accepted" });
+  const verifyKeys = report.filled.filter((key) => !steps[name].fields[key].lookup);
+  return { name, url, report, atom, mode, verifyKeys, stats, fillMs, saveMs, pageGap, saveGap };
+}
+
+/** Reload (or an already-navigated tab), batched readback, mismatch handling. Never SAVEs. */
+async function verifySection(
+  driver: WebDriver,
+  ticket: SavedTicket,
+  data: ApplicationData,
+  how: { reload: boolean } = { reload: true },
+): Promise<SavedSection> {
+  const { name, url, report, atom, mode, verifyKeys, stats, fillMs, saveMs, pageGap, saveGap } = ticket;
   const verifyStarted = Date.now();
-  await navigate(driver, url);
+  if (how.reload) await navigate(driver, url);
   await waitForSection(driver, name, mode);
   const reloadGap = await readLoadGap(driver);
   const reloaded = new URL(await driver.getCurrentUrl());
@@ -1652,9 +1775,6 @@ async function saveStep(
       reloaded.searchParams.get("ApplicationId") !== original.searchParams.get("ApplicationId"))
     throw new WorkingHolidayStop("Unexpected application after SAVE reload.");
   const mismatches: string[] = [];
-  const verifyKeys = report.filled.filter(
-    (key) => !steps[name].fields[key].lookup,
-  );
   // Fast mode reads every saved value in one script instead of two round trips per field.
   const verifyIds = verifyKeys.map((key) => steps[name].fields[key].id);
   let batched = atom ? (await readFieldValues(driver, verifyIds)).values : null;
@@ -1697,13 +1817,30 @@ async function saveStep(
   console.log(`[NZWH] ${name}: saved and verified after reload.`);
   await emit({ type: "persistence", state: "verified" });
   const verifyMs = Date.now() - verifyStarted;
-  console.log(
-    `[NZWH] ${name}: timing fill ${fillMs}ms (fast ${stats.fast}, unchanged ${stats.unchanged}, standard ${stats.standard} in ${stats.standardMs}ms, skipped ${stats.skipped}, segments ${stats.segments}${mode.early ? `, early ${stats.early}, restarts ${stats.restarts}` : ""})${mode.early ? `, settle ${stats.settleMs}ms` : ""}, save ${saveMs}ms, verify ${verifyMs}ms; load gap page ${gapText(pageGap)}/save ${gapText(saveGap)}/reload ${gapText(reloadGap)}ms.`,
-  );
+  logSectionTiming(ticket, verifyMs, reloadGap, "");
   console.log(
     `[NZWH] ${name}: SAVE completed; ${report.persisted.length} values persisted and verified. Continuing in the same tab.`,
   );
   return report;
+}
+const ERROR_LABEL_SCAN_JS = `
+    return Array.from(document.querySelectorAll('[errorlabel]')).filter(e => /mandatory|invalid|error/i.test(e.getAttribute('errorlabel') || '') && e.getBoundingClientRect().width > 0).length;
+  `;
+function logSectionTiming(ticket: SavedTicket, verifyMs: number, reloadGap: number | null, suffix: string): void {
+  const { name, stats, mode, fillMs, saveMs, pageGap, saveGap } = ticket;
+  console.log(
+    `[NZWH] ${name}: timing fill ${fillMs}ms (fast ${stats.fast}, unchanged ${stats.unchanged}, standard ${stats.standard} in ${stats.standardMs}ms, skipped ${stats.skipped}, segments ${stats.segments}${mode.early ? `, early ${stats.early}, restarts ${stats.restarts}` : ""})${mode.early ? `, settle ${stats.settleMs}ms` : ""}, save ${saveMs}ms, verify ${verifyMs}ms${suffix}; load gap page ${gapText(pageGap)}/save ${gapText(saveGap)}/reload ${gapText(reloadGap)}ms.`,
+  );
+}
+
+/** Sequential section save: fill + SAVE, then reload verification in the same tab. */
+async function saveStep(
+  driver: WebDriver,
+  name: string,
+  data: ApplicationData,
+  mode: EntryMode = LEGACY_ENTRY,
+): Promise<SavedSection> {
+  return verifySection(driver, await saveSection(driver, name, data, mode), data, { reload: true });
 }
 
 export interface SavedSectionOptions {
@@ -1764,7 +1901,7 @@ export async function fillAndSaveWorkingHolidaySection(
 export async function runWorkingHoliday(
   options: WorkingHolidayOptions,
 ): Promise<AutomationActionResult> {
-  return execution.run({ hooks: options.hooks, risk: false, credentials: options.credentials, captchaMode: options.captchaMode ?? "manual", signal: options.signal }, () =>
+  return execution.run({ hooks: options.hooks, ...newStore(), credentials: options.credentials, captchaMode: options.captchaMode ?? "manual", signal: options.signal }, () =>
     executeWorkingHoliday(options),
   );
 }
@@ -2006,7 +2143,7 @@ async function executeWorkingHoliday(
           if (actual.pathname !== `/WorkingHoliday/Wizard/${steps[name].page}` ||
               actual.searchParams.get("ApplicationId") !== applicationPage?.searchParams.get("ApplicationId"))
             throw new WorkingHolidayStop("Conditional page unavailable or application changed.");
-          if (!execution.getStore()?.risk) {
+          if (!sectionRisk(name)) {
             // Nothing may have been posted: the normal fill starts again on the freshly loaded section.
             await emit({ type: "phase", phase: "section", message: "Đang xử lý mục hồ sơ đã chọn." });
             finish(`refill (attempt ${attempt})`);
@@ -2057,7 +2194,7 @@ async function executeWorkingHoliday(
         continue;
       }
       const context = execution.getStore();
-      if (context) context.risk = false;
+      context?.riskBySection.set(name, false);
       await emit({
         type: "section-start",
         section: name,
@@ -2152,7 +2289,7 @@ async function executeWorkingHoliday(
             if (state.rejected)
               throw new WorkingHolidayStop(loginRejectedMessage);
             if (error instanceof SessionExpiredError || state.loginForm) {
-              if (execution.getStore()?.risk)
+              if (sectionRisk(name))
                 throw new WorkingHolidayStop(
                   "Phiên đăng nhập hết hạn sau thao tác có thể lưu dữ liệu. Không tự điền lại. Kiểm tra dữ liệu trên Chrome rồi khôi phục có xác nhận.",
                 );

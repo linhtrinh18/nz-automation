@@ -35,3 +35,27 @@ export async function classifyPage(driver: WebDriver, allowedOrigin: string): Pr
   `);
   return dom ?? byUrl;
 }
+
+import type { AuthState } from "./auth-state";
+export interface PageProbe { site: false | true | "busy" | "denied"; captcha: boolean; auth: AuthState }
+/**
+ * One executeScript that answers the site-state, CAPTCHA and auth questions of a poll.
+ * Each part is the existing single-purpose script wrapped in a function, so predicates stay identical.
+ */
+export function buildPageProbeScript(parts: { site: string; captcha: string; auth: string }): string {
+  return `
+    const nzwhSite = (function () {${parts.site}})();
+    const nzwhCaptcha = (function () {${parts.captcha}})();
+    const nzwhAuth = (function () {${parts.auth}})();
+    return { nzwhProbe: 1, site: nzwhSite, captcha: nzwhCaptcha, auth: nzwhAuth };
+  `;
+}
+/** Returns the probe only for a well-formed answer; anything else (older fakes, navigation) is null. */
+export function parsePageProbe(raw: unknown): PageProbe | null {
+  if (typeof raw !== "object" || raw === null) return null;
+  const value = raw as Record<string, unknown>;
+  const auth = value.auth as Record<string, unknown> | null | undefined;
+  if (value.nzwhProbe !== 1 || typeof value.captcha !== "boolean" || typeof auth !== "object" || auth === null) return null;
+  if (!(value.site === false || value.site === true || value.site === "busy" || value.site === "denied")) return null;
+  return { site: value.site, captcha: value.captcha, auth: auth as unknown as AuthState };
+}
