@@ -177,8 +177,8 @@ export type ExecutionEvent =
       section: (typeof sectionNames)[number];
       scenario: string;
     }
-  | { type: "persistence"; state: "possible" | "accepted" | "verified" }
-  | { type: "captcha"; waiting: boolean; message?: string }
+  | { type: "persistence"; state: "possible" | "accepted" | "verified"; section?: (typeof sectionNames)[number]; background?: true }
+  | { type: "captcha"; waiting: boolean; message?: string; section?: (typeof sectionNames)[number]; background?: true }
   | { type: "phase"; phase: string; message: string; debugPort?: number }
   | {
       type: "section-result";
@@ -186,6 +186,8 @@ export type ExecutionEvent =
       detail: string;
       checked?: number;
       blocked?: number;
+      section?: (typeof sectionNames)[number];
+      background?: true;
     };
 export interface ExecutionHooks {
   event(event: ExecutionEvent): Promise<void>;

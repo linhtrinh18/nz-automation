@@ -6,9 +6,11 @@ import { join } from "node:path";
 import { blankApplication } from "./application-data";
 const browser = vi.hoisted(() => ({ choose: vi.fn() }));
 vi.mock("../browser/chooseBrowser", () => ({ chooseBrowser: browser.choose }));
+import { markWindowSizedAtLaunch } from "../browser/window-size";
 import { runWorkingHoliday } from "./run";
 
-test("login-only confirms authentication and leaves Chrome open without touching an application", async () => {
+test.each([[false, 1], [true, 0]])("login-only confirms authentication and leaves Chrome open without touching an application (sized at launch: %s)", async (sized, maximizeCalls) => {
+  const maximize = vi.fn(async () => {});
   const directory = await mkdtemp(join(tmpdir(), "nzwh-login-only-"));
   let authenticated = false;
   let url = "about:blank";
@@ -21,7 +23,7 @@ test("login-only confirms authentication and leaves Chrome open without touching
   const driver = {
     get: async (next: string) => { destinations.push(next); url = next; },
     getCurrentUrl: async () => url, getCapabilities: async () => null,
-    manage: () => ({ setTimeouts: async () => {}, window: () => ({ maximize: async () => {} }) }),
+    manage: () => ({ setTimeouts: async () => {}, window: () => ({ maximize }) }),
     sendDevToolsCommand: async () => {}, quit,
     executeScript: async (script: string) => {
       if (script.includes("return document.readyState")) return "complete";
@@ -32,6 +34,7 @@ test("login-only confirms authentication and leaves Chrome open without touching
     findElement: (locator: { value: string }) => element(locator.value),
     wait: async (condition: unknown) => typeof condition === "function" ? (condition as () => unknown)() : element("username"),
   } as unknown as WebDriver;
+  if (sized) markWindowSizedAtLaunch(driver);
   browser.choose.mockResolvedValue(driver);
   try {
     const dataPath = join(directory, "blank.json");
@@ -40,6 +43,7 @@ test("login-only confirms authentication and leaves Chrome open without touching
     expect(result).toMatchObject({ success: true, outcome: "loggedIn" });
     expect(clicked).toEqual(['input[type="submit"][value="LOGIN"]']);
     expect(destinations.every(destination => !/Wizard|Create|Submit|Payment/.test(destination))).toBe(true);
+    expect(maximize).toHaveBeenCalledTimes(maximizeCalls);
     expect(quit).not.toHaveBeenCalled();
     expect(result.driver).toBe(driver);
   } finally { await rm(directory, { recursive: true, force: true }); }

@@ -7,6 +7,7 @@ import { join } from "node:path";
 import { Builder } from "selenium-webdriver";
 import { Options, ServiceBuilder } from "selenium-webdriver/chrome";
 import { WorkingHolidayStop } from "../workflow/errors";
+import { markWindowSizedAtLaunch } from "./window-size";
 import type { WebDriver } from "selenium-webdriver";
 
 const MAC_CHROME = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome";
@@ -61,7 +62,10 @@ export async function chooseBrowser(type: BrowserType, useDefaultAgent = true, p
   const onAbort = () => stopSpawned(spawned);
   signal?.addEventListener("abort", onAbort, { once: true });
   try {
-    return await startBrowser();
+    const driver = await startBrowser();
+    // Both non-attach paths (spawned Chrome and driver-launched Chrome) pass --window-size.
+    if (!attachPort) markWindowSizedAtLaunch(driver);
+    return driver;
   } finally {
     signal?.removeEventListener("abort", onAbort);
   }

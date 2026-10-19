@@ -17,6 +17,8 @@ import { scenarioData, validateData } from "./data-validation";
 export { scenarioData, validateData } from "./data-validation";
 export { WorkingHolidayStop } from "./errors";
 import { chooseBrowser } from "../browser/chooseBrowser";
+import { pipelineSnapshot } from "./tab-pipeline";
+import { windowSizedAtLaunch } from "../browser/window-size";
 
 import { readAuthState } from "./auth-state";
 import { applicationDataSchema as dataSchema } from "./application-data";
@@ -1745,7 +1747,7 @@ export async function fillAndSaveWorkingHolidaySection(
     throw new WorkingHolidayStop(
       "Driver must be on the selected existing draft section.",
     );
-  await driver.manage().window().maximize();
+  if (!windowSizedAtLaunch(driver)) await driver.manage().window().maximize();
   await requireSession(driver);
   // Caller-provided driver of unknown strategy, already loaded: phase-1 entry only.
   const entry: EntryMode = { fast: fastEntrySnapshot(), early: false };
@@ -1779,6 +1781,8 @@ async function executeWorkingHoliday(
   if (mode !== "loginOnly") validateData(data);
   const fast = mode !== "loginOnly" && fastEntrySnapshot();
   const requestedEager = earlyEntrySnapshot(fast);
+  for (const line of pipelineSnapshot(process.env, { attachPort: options.attachPort, fast, early: requestedEager, loginOnly: mode === "loginOnly" }).log)
+    console.log(line);
   if (mode !== "loginOnly" && base.dataKind === "fictional" && !options.allowFictionalDraftSave)
     throw new WorkingHolidayStop(
       "Saving fictional values in the existing live draft requires explicit --allow-fictional-draft-save opt-in.",
@@ -1838,7 +1842,7 @@ async function executeWorkingHoliday(
   });
   await checkpoint();
   await driver.manage().setTimeouts({ pageLoad: 30000, script: 15000 });
-  await driver.manage().window().maximize();
+  if (!windowSizedAtLaunch(driver)) await driver.manage().window().maximize();
   await activateChrome(driver);
   // Use one existing tab for the sequential save flow.
   if (options.attachPort) {

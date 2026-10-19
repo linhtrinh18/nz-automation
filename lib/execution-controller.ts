@@ -43,9 +43,18 @@ export class ExecutionController implements ExecutionHooks {
       ["running", "waiting_captcha"].includes(item.status),
     );
   }
+  /** Section name to outcome key, filled from section-start so keyed events reach the right item. */
+  private keys = new Map<string, string>();
+  private resolve(event: ExecutionEvent) {
+    const section = "section" in event ? event.section : undefined;
+    const key = section ? this.keys.get(section) : undefined;
+    return key ? this.job.outcomes.find((item) => item.key === key) : this.current();
+  }
   async event(event: ExecutionEvent): Promise<void> {
     if (this.closed) return;
-    const current = this.current();
+    const current = this.resolve(event);
+    // Background (other tab) events never overwrite the foreground phase/message.
+    const background = "background" in event && event.background === true;
     if (event.type === "application") {
       this.job.applicationId = event.id;
     } else if (event.type === "submission") {
@@ -60,13 +69,14 @@ export class ExecutionController implements ExecutionHooks {
       );
       if (!item || item.status !== "pending")
         throw new Error("Phạm vi thực thi không khớp kế hoạch đã xác nhận.");
+      this.keys.set(event.section, item.key);
       item.status = "running";
       item.startedAt = new Date().toISOString();
       this.job.phase = "section";
       this.job.message = "Đang xử lý mục hồ sơ đã chọn.";
     } else if (event.type === "persistence" && current) {
       current.persistence = event.state;
-      this.job.phase = event.state === "verified" ? "verified" : "saving";
+      if (!background) this.job.phase = event.state === "verified" ? "verified" : "saving";
       current.detail =
         event.state === "possible"
           ? "Đã bắt đầu thao tác có thể gửi dữ liệu; chưa biết đã lưu hay chưa."
@@ -74,8 +84,8 @@ export class ExecutionController implements ExecutionHooks {
             ? "Trang đã phản hồi thao tác lưu; đang tải lại để xác minh."
             : "Đã xác minh dữ liệu sau khi tải lại.";
     } else if (event.type === "captcha") {
-      this.job.phase = event.waiting ? "captcha" : "section";
-      this.job.message = event.waiting
+      if (!background || event.waiting) this.job.phase = event.waiting ? "captcha" : "section";
+      if (!background || event.waiting) this.job.message = event.waiting
         ? event.message ?? "Hãy tự giải CAPTCHA trong Chrome. Tác vụ kiểm tra mỗi 0,2 giây và tự bấm nút Submit riêng của CAPTCHA khi giải xong. Lệnh tạm dừng/dừng áp dụng tại ranh giới an toàn."
         : event.message ?? "CAPTCHA đã hoàn tất; tiếp tục xử lý.";
       if (current)
@@ -146,11 +156,10 @@ export class ExecutionController implements ExecutionHooks {
     if (status === "interrupted") this.job = interruptJob(this.job, message);
     else if (status === "stopped") this.job = stopJob(this.job, message);
     else {
-      const current = this.current();
-      if (current) {
-        current.status =
-          current.persistence === "accepted" ? "saved_unverified" : "failed";
-        current.detail = message;
+      for (const item of this.job.outcomes) {
+        if (!["running", "waiting_captcha"].includes(item.status)) continue;
+        item.status = item.persistence === "accepted" ? "saved_unverified" : "failed";
+        item.detail = message;
       }
       this.job.status = status;
       this.job.message = message;
