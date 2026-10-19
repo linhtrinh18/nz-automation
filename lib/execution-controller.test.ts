@@ -245,3 +245,45 @@ test("resuming a paused worker rechecks credentials before continuing", async ()
   await rejected;
   expect(validate).toHaveBeenCalledTimes(2);
 });
+test("boundary: stop throws at a real boundary but is returned as a value during a prefetch", async () => {
+  await command("stop");
+  await expect(controller.boundary({ prefetch: true })).resolves.toEqual({ command: "stop" });
+  await expect(controller.boundary({ prefetch: false })).rejects.toBeInstanceOf(StopRequested);
+});
+test("boundary: pause is returned during a prefetch (no pause loop), and runs while an item is running", async () => {
+  const scenario = controller.job.outcomes[0].key.split(":")[0];
+  await controller.event({ type: "section-start", section: "personal", scenario });
+  await command("pause");
+  await expect(controller.boundary({ prefetch: true })).resolves.toEqual({ command: "pause" });
+  expect(controller.job.status).toBe("running");
+  const pending = controller.boundary({ prefetch: false });
+  await new Promise((resolve) => setTimeout(resolve, 50));
+  expect(controller.job.status).toBe("paused");
+  await command("continue");
+  await expect(pending).resolves.toMatchObject({ command: "continue" });
+});
+test("boundary: a rejected credential validation is deferred, not thrown, and surfaces when awaited", async () => {
+  const rejecting = new ExecutionController(store, controller.job, async () => { throw new Error("credentials changed"); });
+  const result = await rejecting.boundary({ prefetch: false });
+  expect(result.command).toBe("continue");
+  await expect(result.validated).rejects.toThrow("credentials changed");
+});
+test("keyed events reach their own item; background events leave the job message alone except captcha waiting", async () => {
+  const scenario = controller.job.outcomes[0].key.split(":")[0];
+  await controller.event({ type: "section-start", section: "personal", scenario });
+  await controller.event({ type: "section-start", section: "health", scenario });
+  const message = controller.job.message;
+  await controller.event({ type: "persistence", state: "accepted", section: "personal", background: true });
+  const personal = controller.job.outcomes.find((item) => item.key.endsWith(":personal"))!;
+  const health = controller.job.outcomes.find((item) => item.key.endsWith(":health"))!;
+  expect(personal.persistence).toBe("accepted");
+  expect(health.persistence).toBe("none");
+  expect(controller.job.message).toBe(message);
+  await controller.event({ type: "captcha", waiting: true, section: "personal", background: true });
+  expect(controller.job.message).not.toBe(message);
+  await controller.event({ type: "section-result", status: "failed", detail: "x", section: "personal", background: true });
+  expect(personal.status).toBe("saved_unverified");
+  expect(health.status).toBe("running");
+  await controller.finish("failed", "stop");
+  expect(health.status).toBe("failed");
+});

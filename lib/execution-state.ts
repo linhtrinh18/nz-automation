@@ -192,4 +192,6 @@ export type ExecutionEvent =
 export interface ExecutionHooks {
   event(event: ExecutionEvent): Promise<void>;
   checkpoint(): Promise<void>;
+  /** Scheduler boundary (see ExecutionController.boundary); absent in simple hooks, which use checkpoint(). */
+  boundary?(options: { prefetch: boolean }): Promise<{ command: "continue" | "pause" | "stop"; validated?: Promise<void> }>;
 }

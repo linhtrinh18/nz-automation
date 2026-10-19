@@ -117,11 +117,37 @@ export class ExecutionController implements ExecutionHooks {
   }
   async checkpoint(): Promise<void> {
     if (this.current()) return; // Never pause or stop within a section/postback/restore operation.
-    let command = await this.store.command(this.job.id);
+    const command = await this.store.command(this.job.id);
     if (command.action === "stop" || command.action === "terminate")
       throw new StopRequested();
     await this.validateCredentials?.();
     if (command.action !== "pause") return;
+    await this.pauseUntilResumed();
+  }
+  /**
+   * Section-boundary decision for the section scheduler. Unlike checkpoint() it does not skip itself while an
+   * item is running: the scheduler owns the safe-boundary decision (earlier tabs may still be verifying).
+   * prefetch=false: stop throws StopRequested, pause waits, then continue. prefetch=true: never throws or
+   * pauses; stop/pause are returned so the scheduler can cancel the prefetch before anything is emitted.
+   * Credential validation starts here and is returned (not awaited) so it overlaps the section's own work.
+   */
+  async boundary(options: { prefetch: boolean }): Promise<{ command: "continue" | "pause" | "stop"; validated?: Promise<void> }> {
+    const command = await this.store.command(this.job.id);
+    const stop = command.action === "stop" || command.action === "terminate";
+    if (options.prefetch) {
+      if (stop) return { command: "stop" };
+      if (command.action === "pause") return { command: "pause" };
+    } else {
+      if (stop) throw new StopRequested();
+      if (command.action === "pause") await this.pauseUntilResumed();
+    }
+    const validated = this.validateCredentials?.();
+    // Rejection is observed when the section's own SAVE awaits it; this only prevents an unhandled rejection.
+    validated?.catch(() => undefined);
+    return { command: "continue", validated };
+  }
+  private async pauseUntilResumed(): Promise<void> {
+    let command = await this.store.command(this.job.id);
     this.job.status = "paused";
     this.job.phase = "paused";
     this.job.message =

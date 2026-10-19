@@ -126,6 +126,25 @@ export function withHooksForTest<T>(hooks: ExecutionHooks, fn: () => Promise<T>,
 async function checkpoint(): Promise<void> {
   await execution.getStore()?.hooks?.checkpoint();
 }
+/** Errors from a credential validation that overlapped a section; they stop the run exactly as checkpoint() did. */
+const validationFailures = new WeakSet<object>();
+/**
+ * E1: section boundary. With scheduler hooks the credential validation starts now and is awaited right before the
+ * section's own CAPTCHA/SAVE; without them this is today's checkpoint().
+ */
+async function sectionBoundary(name: string, prefetch = false): Promise<"continue" | "pause" | "stop"> {
+  const context = execution.getStore();
+  if (!context?.hooks?.boundary) {
+    await checkpoint();
+    return "continue";
+  }
+  const result = await context.hooks.boundary({ prefetch });
+  if (result.command === "continue" && result.validated) {
+    result.validated.catch((error: unknown) => { if (typeof error === "object" && error) validationFailures.add(error); });
+    context.validations.set(name, result.validated);
+  }
+  return result.command;
+}
 class SessionExpiredError extends WorkingHolidayStop {}
 const loginRejectedMessage =
   "Login rejected: incorrect credentials or account locked. No automatic retry. Check the assigned NZWH credentials and resolve account access manually before restarting.";
@@ -1294,8 +1313,10 @@ interface FillStats {
   early: number;
   restarts: number;
   settleMs: number;
+  /** Authoritative writes that replaced an early write (a load-time handler changed the field); gates nothing, aids diagnosis. */
+  changedAfterEarly: number;
 }
-const emptyStats = (): FillStats => ({ fast: 0, unchanged: 0, standard: 0, skipped: 0, segments: 0, standardMs: 0, early: 0, restarts: 0, settleMs: 0 });
+const emptyStats = (): FillStats => ({ fast: 0, unchanged: 0, standard: 0, skipped: 0, segments: 0, standardMs: 0, early: 0, restarts: 0, settleMs: 0, changedAfterEarly: 0 });
 
 /** A redirect to the access-denied page is not a reload of our form: decide that before marking a save as possible. */
 async function throwIfAccessDenied(driver: WebDriver): Promise<void> {
@@ -1460,12 +1481,13 @@ async function fastFillSection(
       throw error;
     }
   };
+  const earlyKeys = new Set<string>();
   const runEarly = async () => {
     const resumes = new Map<string, number>();
     let index = 0;
     while (index < entries.length) {
       const out = await segment(index, { deferClears: true, restoreEarly: false });
-      for (const result of out.results) if (result.status === "filled") stats.early++;
+      for (const result of out.results) if (result.status === "filled") { stats.early++; earlyKeys.add(result.key); }
       if (!out.stop) return;
       const i = out.stop.index;
       const entry = entries[i];
@@ -1525,6 +1547,7 @@ async function fastFillSection(
     while (index < entries.length) {
       const out = await segment(index, { deferClears: false, restoreEarly: true });
       record(out);
+      for (const result of out.results) if (result.status === "filled" && earlyKeys.has(result.key)) stats.changedAfterEarly++;
       if (out.results.some((result) => result.status === "filled")) wrote = true;
       if (!out.stop) break;
       const i = out.stop.index;
@@ -1578,6 +1601,7 @@ async function fastFillSection(
         stats.restarts++;
         continue;
       }
+      // E5: the second barrier only follows an authoritative pass that wrote something the early pass had not.
       if (pass.wrote) await settle();
       return;
     }
@@ -2183,7 +2207,7 @@ async function executeWorkingHoliday(
         !options.taskKeys.includes(`${scenario}:${name}`)
       )
         continue;
-      await checkpoint();
+      await sectionBoundary(name);
       console.log(
         `[NZWH] Opening section ${sectionIndex + 1}/${selected.length}: ${name}. url=${await driver.getCurrentUrl().then((u) => new URL(u).pathname).catch(() => "?")}`,
       );
@@ -2191,6 +2215,7 @@ async function executeWorkingHoliday(
         console.log(
           "[NZWH] Adviser skipped: personal.representedByAdviser is No. Use an adviser scenario to fill this section.",
         );
+        await execution.getStore()?.validations.get(name); // a skipped section still honors its boundary validation
         continue;
       }
       const context = execution.getStore();
@@ -2236,6 +2261,7 @@ async function executeWorkingHoliday(
         } catch (caught) {
           let error: unknown = caught;
           if (error instanceof StopRequested) throw error;
+          if (typeof error === "object" && error && validationFailures.has(error)) throw error;
           if (error instanceof AccessDeniedError) {
             checkCancelled();
             let result: DeniedOutcome;

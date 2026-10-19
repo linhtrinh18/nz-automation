@@ -506,3 +506,14 @@ test("the early timing line adds early, restarts and settle, and still carries n
   expect(timing).toMatch(/^\[NZWH\] identification: timing fill \d+ms \(fast \d+, unchanged \d+, standard 0 in \d+ms, skipped 0, segments \d+, early 6, restarts 0\), settle \d+ms, save \d+ms, verify \d+ms; load gap page n\/a\/save n\/a\/reload n\/ams\.$/);
   noSentinel();
 });
+test("E5: authoritative pass identical to the early pass runs one settle barrier; a differing write runs two", async () => {
+  const same = fake();
+  await runEarly(same);
+  const settleReads = same.log.filter((l) => l === "settle").length;
+  expect(settleReads).toBeGreaterThan(0);
+  const differing = fake();
+  // The early segment writes nothing, so the authoritative pass writes values the early pass did not.
+  differing.segments.push({ results: [], stop: null, timeOrigin: 1 });
+  await runEarly(differing);
+  expect(differing.log.filter((l) => l === "settle").length).toBe(settleReads * 2);
+});
