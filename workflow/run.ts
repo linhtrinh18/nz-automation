@@ -836,6 +836,39 @@ async function setField(
   if (!field.lookup) await element.sendKeys(Key.TAB);
 }
 
+/**
+ * Page access for background tabs over raw CDP. ChromeDriver blocks every WebDriver command on a tab whose navigation is
+ * still loading, which would stall the foreground tab; Runtime.evaluate and Page.navigate do not wait.
+ * Only scripts that pass JSON-serialisable arguments may run through it (no WebElements).
+ */
+function cdpPage(driver: WebDriver): WebDriver {
+  const chromium = driver as Driver;
+  const evaluate = async <T>(script: string, args: unknown[]): Promise<T> => {
+    const out = await (chromium.sendAndGetDevToolsCommand("Runtime.evaluate", {
+      expression: `(function () {${script}}).apply(null, ${JSON.stringify(args)})`,
+      returnByValue: true,
+    }) as unknown as Promise<{ result?: { value?: T }; exceptionDetails?: { text?: string; exception?: { description?: string } } }>);
+    if (out?.exceptionDetails) {
+      const error = new Error(`${out.exceptionDetails.exception?.description ?? out.exceptionDetails.text ?? "script error"}`);
+      error.name = "JavascriptError";
+      throw error;
+    }
+    return out?.result?.value as T;
+  };
+  const page = {
+    executeScript: <T>(script: string, ...args: unknown[]) => evaluate<T>(script, args),
+    getCurrentUrl: () => evaluate<string>("return location.href", []),
+  };
+  return page as unknown as WebDriver;
+}
+/**
+ * Non-blocking navigation of the current tab (never driver.get in a background step). A navigation started inside the
+ * command makes ChromeDriver wait for it, so the script only schedules it; commands on other tabs then run immediately.
+ */
+async function navigateWithoutWaiting(driver: WebDriver, url: string): Promise<void> {
+  await driver.executeScript("setTimeout(() => { location.href = arguments[0]; }, 30)", url);
+}
+
 async function activateChrome(driver: WebDriver): Promise<void> {
   const chromium = driver as Driver;
   await chromium.sendDevToolsCommand("Page.setWebLifecycleState", {
@@ -2437,48 +2470,51 @@ async function executeWorkingHoliday(
       closeTab: async () => { await driver.close(); },
       focus: async (handle) => { await driver.switchTo().window(handle); await activateChrome(driver); },
       rescan: async () => {
+        const page = cdpPage(driver);
         try {
-          if (!(await documentComplete(driver))) return "pending";
-          return await driver.executeScript<number>(ERROR_LABEL_SCAN_JS);
+          if (!(await documentComplete(page))) return "pending";
+          return await page.executeScript<number>(ERROR_LABEL_SCAN_JS);
         } catch (error) { if (isNavigationError(error)) return "pending"; throw error; }
       },
       startReload: async (tab) => {
-        tab.stamp = await readTimeOrigin(driver);
-        await driver.executeScript("location.href = arguments[0]", (tab.ticket as SavedTicket).url);
+        tab.stamp = await readTimeOrigin(cdpPage(driver));
+        await navigateWithoutWaiting(cdpPage(driver), (tab.ticket as SavedTicket).url);
       },
       pollReload: async (tab) => {
+        const page = cdpPage(driver);
         try {
-          const probe = await readPageProbe(driver);
+          const probe = await readPageProbe(page);
           if (probe) {
             if (probe.site === "denied") return "denied";
             if (probe.site) return "busy";
             if (probe.auth.rejected || probe.auth.loginForm) return "login";
             if (probe.captcha) return "captcha";
           } else {
-            const site = await driver.executeScript<unknown>(SITE_STATE_JS);
+            const site = await page.executeScript<unknown>(SITE_STATE_JS);
             if (site === "denied") return "denied";
             if (site) return "busy";
-            const auth = await readAuthState(driver);
+            const auth = await readAuthState(page);
             if (auth.rejected || auth.loginForm) return "login";
-            if (await captchaPending(driver)) return "captcha";
+            if (await captchaPending(page)) return "captcha";
           }
-          if ((await readTimeOrigin(driver)) === tab.stamp) return "pending";
-          return (await sectionDomReady(driver, firstFieldId(tab.name))) ? "ready" : "pending";
+          if ((await readTimeOrigin(page)) === tab.stamp) return "pending";
+          return (await sectionDomReady(page, firstFieldId(tab.name))) ? "ready" : "pending";
         } catch (error) { if (isNavigationError(error)) return "pending"; throw error; }
       },
       readback: async (tab) => {
         const ticket = tab.ticket as SavedTicket;
+        const page = cdpPage(driver);
         try {
-          const actual = new URL(await driver.getCurrentUrl());
+          const actual = new URL(await page.getCurrentUrl());
           const original = new URL(ticket.url);
           if (actual.origin !== original.origin || actual.pathname !== original.pathname ||
               actual.searchParams.get("ApplicationId") !== original.searchParams.get("ApplicationId")) return { kind: "unexpected" };
           const ids = ticket.verifyKeys.map((key) => steps[tab.name].fields[key].id);
-          const read = await readFieldValues(driver, ids);
+          const read = await readFieldValues(page, ids);
           const wrong = ticket.verifyKeys.filter((key, position) =>
             read.values[position] !== expectedFieldValue(tab.name, key, data[tab.name][key]));
           // Early entry reads at DOM-ready: re-read once the document is complete before concluding.
-          if (wrong.length && !(await documentComplete(driver))) return { kind: "pending" };
+          if (wrong.length && !(await documentComplete(page))) return { kind: "pending" };
           if (wrong.length) {
             for (const key of wrong) {
               const position = ticket.verifyKeys.indexOf(key);
@@ -2567,10 +2603,9 @@ async function executeWorkingHoliday(
       const main = await driver.getWindowHandle();
       let scheduler!: TabScheduler;
       scheduler = new TabScheduler(backgroundOps(), main, { onOutcome: (tab, finalizing) => applyOutcome(scheduler)(tab, finalizing) },
-        { verifyTimeoutMs: READY_WAIT_MS + SECTION_WAIT_MS, pollMs: FAST_POLL_MS });
+        { verifyTimeoutMs: READY_WAIT_MS + SECTION_WAIT_MS, pollMs: FAST_POLL_MS, stepMs: 100 });
       context.pipelineActive = true;
       context.onChallenge = () => scheduler.noteChallenge();
-      let lastUrl: string | undefined;
       const location = async (handle: string, fn: () => Promise<void>) => {
         const previous = scheduler.focused;
         await scheduler.focus(handle);
@@ -2588,7 +2623,7 @@ async function executeWorkingHoliday(
               await emit({ type: "section-start", section: name, scenario });
             },
             load: (name, handle) => location(handle, async () => {
-              await driver.executeScript("location.href = arguments[0]", sectionUrl(name));
+              await navigateWithoutWaiting(driver, sectionUrl(name));
             }),
             fill: async (name, _tab, ctl) => {
               context.currentSection = name;
@@ -2599,7 +2634,6 @@ async function executeWorkingHoliday(
                   actual.searchParams.get("ApplicationId") !== applicationPage?.searchParams.get("ApplicationId"))
                 throw new WorkingHolidayStop("Conditional page unavailable or application changed.");
               const ticket = await saveSection(driver, name, data, entry, { interactive: true, beforePost: ctl.beforePost });
-              lastUrl = ticket.url;
               return ticket;
             },
             skip: async (name) => {
@@ -2615,11 +2649,9 @@ async function executeWorkingHoliday(
           throw error;
         }
         if (!result.downgraded) {
-          const foregroundWasExtra = scheduler.focused !== main;
-          await scheduler.closeExtra();
+          // Keep the tab that shows the last section; the submission phase continues there like the sequential run.
+          await scheduler.collapse();
           context.pipelineActive = false;
-          // The submission phase continues in the main tab; put it on the last section page like the sequential run.
-          if (foregroundWasExtra && lastUrl) await navigate(driver, lastUrl);
           return;
         }
         console.log(`[NZWH] Tab pipeline downgraded to off: ${result.downgraded}.`);
@@ -2633,7 +2665,7 @@ async function executeWorkingHoliday(
             tab.phase = "done";
           } else await finishReadOnly(scheduler, tab);
         }
-        await scheduler.closeExtra();
+        await scheduler.collapse();
         context.pipelineActive = false;
         for (const rest of result.remaining) {
           const carried = result.error !== undefined && !result.errorPosted && rest.name === result.errorSection;

@@ -373,3 +373,25 @@ test.each(["success", "error", "missing", "unsupported", "database-failure"])("A
   if (kind !== "unsupported") expect(events.some(e => e.type === "captcha" && e.message?.includes("AutoCaptcha"))).toBe(true);
   expect(JSON.stringify(events)).not.toMatch(/auto-secret|auto-token|private-database-details/);
 });
+const cleanAuth = { loginForm: false, rejected: false, authenticated: true };
+test("E2: a clean page probe replaces the separate site and CAPTCHA scripts for a poll", async () => {
+  const executeScript = vi.fn(async (script: string) => {
+    if (script.includes("nzwhProbe")) return { nzwhProbe: 1, site: false, captcha: false, auth: cleanAuth };
+    throw new Error(`unexpected script: ${script.slice(0, 40)}`);
+  });
+  await expect(waitWithCaptcha({ executeScript } as unknown as WebDriver, async () => true, 1000)).resolves.toBe(true);
+  expect(executeScript).toHaveBeenCalledTimes(1);
+});
+test("E2: a probe that sees busy falls through to the full guard, which throws as before", async () => {
+  const { driver, executeScript } = fixture([false], true);
+  const fallback = executeScript.getMockImplementation()!;
+  executeScript.mockImplementation(async script => script.includes("nzwhProbe") ? { nzwhProbe: 1, site: "busy", captcha: false, auth: cleanAuth } : fallback(script));
+  await expect(waitWithCaptcha(driver, async () => true, 1000)).rejects.toBeInstanceOf(SiteBusyError);
+});
+test("E2: a probe that sees a CAPTCHA hands the poll to the guard", async () => {
+  const { driver, executeScript } = fixture([true, false, false], false);
+  const fallback = executeScript.getMockImplementation()!;
+  executeScript.mockImplementation(async script => script.includes("nzwhProbe") ? { nzwhProbe: 1, site: false, captcha: true, auth: cleanAuth } : fallback(script));
+  await expect(waitWithCaptcha(driver, async () => true, 1000)).resolves.toBe(true);
+  expect(executeScript.mock.calls.some(([script]) => script.includes("const challengePage"))).toBe(true);
+});

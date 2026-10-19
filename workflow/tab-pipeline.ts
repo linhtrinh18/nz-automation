@@ -54,6 +54,8 @@ export interface SectionTab<T = unknown> {
   verifyStartedAt?: number;
   /** The section-result for this outcome was already emitted (load-time failure). */
   reported?: boolean;
+  /** Earliest time of the next background step (keeps tab switches off the foreground critical path). */
+  nextStepAt?: number;
   ticket?: T;
 }
 
@@ -140,7 +142,7 @@ export interface SchedulerHooks {
   /** Report a terminal outcome (events, coverage files). `finalizing` outcomes are reported, never thrown on. */
   onOutcome(tab: SectionTab, finalizing: boolean): Promise<void>;
 }
-export interface SchedulerOptions { verifyTimeoutMs: number; pollMs: number }
+export interface SchedulerOptions { verifyTimeoutMs: number; pollMs: number; /** Minimum gap between background steps of one tab (default 0). */ stepMs?: number }
 
 /** Cooperative two-slot scheduler: one foreground tab, background tabs advance one cheap step per drain(). */
 export class TabScheduler {
@@ -150,7 +152,7 @@ export class TabScheduler {
   drainMs = 0;
   private extra: string | undefined;
   private challenges = 0;
-  constructor(private ops: TabOps, readonly main: string, private hooks: SchedulerHooks, private options: SchedulerOptions) {
+  constructor(private ops: TabOps, private main: string, private hooks: SchedulerHooks, private options: SchedulerOptions) {
     this.focused = main;
   }
   /** Sections alternate between the main tab and one reused extra tab. */
@@ -164,6 +166,8 @@ export class TabScheduler {
     }
     return this.extra;
   }
+  /** Creates the reused extra tab ahead of time (called while the foreground waits on a page load). */
+  async warm(): Promise<void> { await this.handleFor(1); }
   isPipelineHandle(handle: string): boolean { return handle === this.main || handle === this.extra; }
   private async guard<T>(fn: () => Promise<T>): Promise<T> {
     try { return await fn(); }
@@ -190,14 +194,15 @@ export class TabScheduler {
   async drain(finalizing = false): Promise<void> {
     if (this.ops.aborted?.() && !finalizing) throw new StopRequested();
     if (!finalizing && this.challenges >= 2) throw new PipelineDowngrade("captcha-repeat");
-    const open = this.background();
-    if (!open.length) return;
     const started = this.ops.now();
+    const open = this.background().filter(tab => (tab.nextStepAt ?? 0) <= started);
+    if (!open.length) return;
     const foreground = this.focused;
     try {
       for (const tab of open) {
         if (finalizing && this.ops.aborted?.()) break;
         await this.focus(tab.handle);
+        tab.nextStepAt = this.ops.now() + (this.options.stepMs ?? 0);
         await this.step(tab, finalizing);
       }
     } finally {
@@ -211,8 +216,9 @@ export class TabScheduler {
         const flagged = await this.ops.rescan(tab);
         if (flagged === "pending") return;
         // Emits `persistence accepted` only when clean; a flagged field fails the section while persistence is "possible".
-        if (!(await loadTimeRescan(tab, async () => flagged, this.ops.emit))) await this.settle(tab, finalizing);
-        return;
+        if (!(await loadTimeRescan(tab, async () => flagged, this.ops.emit))) return this.settle(tab, finalizing);
+        // Clean: start the verification reload in the same step (the tab is already focused).
+        return this.step(tab, finalizing);
       }
       case "accepted":
         await this.ops.startReload(tab);
@@ -278,6 +284,24 @@ export class TabScheduler {
       log(`[NZWH] Tab pipeline: finalizing in-flight sections stopped early (${error instanceof Error ? error.name : "error"}).`);
     }
   }
+  /**
+   * End of a successful pipeline: keep the tab that is in the foreground (it already shows the last section, so the
+   * submission phase needs no extra navigation) and close the other one.
+   */
+  async collapse(): Promise<void> {
+    const extra = this.extra;
+    if (!extra) return;
+    const keep = this.focused;
+    const close = keep === extra ? this.main : extra;
+    try {
+      await this.ops.focus(close); this.focused = close;
+      await this.ops.closeTab(close);
+    } catch { /* already closed */ }
+    this.extra = undefined;
+    this.main = keep;
+    try { await this.ops.focus(keep); this.focused = keep; } catch { /* nothing left */ }
+  }
+  get mainHandle(): string { return this.main; }
   /** Closes the reused extra tab and returns focus to the main tab. */
   async closeExtra(): Promise<void> {
     const extra = this.extra;
@@ -343,6 +367,7 @@ export async function runPipelinedSections<T>(names: SectionName[], deps: Pipeli
   };
   const remainingFrom = (index: number) => names.slice(index).filter(name => !posted.has(name)).map(name => ({ name, started: started.has(name) }));
   let index = 0;
+  let warmed = false;
   try {
     for (index = 0; index < names.length; index++) {
       const name = names[index];
@@ -356,7 +381,10 @@ export async function runPipelinedSections<T>(names: SectionName[], deps: Pipeli
       await scheduler.focus(handle);
       const tab: SectionTab<T> = { name, handle, phase: "filling" };
       tab.ticket = await deps.fill(name, tab, {
-        drain: () => scheduler.drain(),
+        drain: async () => {
+          if (!warmed && names.length > index + 1) { warmed = true; await scheduler.warm(); }
+          await scheduler.drain();
+        },
         beforePost: async () => {
           if (scheduler.tabs.some(other => other.phase === "posted")) throw new Error("A SAVE is already in flight.");
           await scheduler.awaitSaveGate(previous, barrier);
@@ -372,6 +400,8 @@ export async function runPipelinedSections<T>(names: SectionName[], deps: Pipeli
         },
       });
       tab.phase = "domready";
+      // The tab is still in the foreground: start its load-time re-scan and verification reload before leaving it.
+      await scheduler.drain();
     }
     await scheduler.awaitAllDone();
     return { remaining: [] };

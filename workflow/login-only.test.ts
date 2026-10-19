@@ -9,7 +9,9 @@ vi.mock("../browser/chooseBrowser", () => ({ chooseBrowser: browser.choose }));
 import { markWindowSizedAtLaunch } from "../browser/window-size";
 import { runWorkingHoliday } from "./run";
 
-test.each([[false, 1], [true, 0]])("login-only confirms authentication and leaves Chrome open without touching an application (sized at launch: %s)", async (sized, maximizeCalls) => {
+test.each([[false, 1, undefined, 1], [true, 0, undefined, 1], [false, 1, "0", 3]])("login-only confirms authentication and leaves Chrome open without touching an application (sized at launch: %s, early fill %s)", async (sized, maximizeCalls, earlyFill, readyCalls) => {
+  if (earlyFill) vi.stubEnv("NZWH_EARLY_FILL", earlyFill);
+  let readyReads = 0;
   const maximize = vi.fn(async () => {});
   const directory = await mkdtemp(join(tmpdir(), "nzwh-login-only-"));
   let authenticated = false;
@@ -26,7 +28,7 @@ test.each([[false, 1], [true, 0]])("login-only confirms authentication and leave
     manage: () => ({ setTimeouts: async () => {}, window: () => ({ maximize }) }),
     sendDevToolsCommand: async () => {}, quit,
     executeScript: async (script: string) => {
-      if (script.includes("return document.readyState")) return "complete";
+      if (script.includes("return document.readyState")) { readyReads++; return "complete"; }
       if (script.includes("loginForm:")) return { loginForm: !authenticated, rejected: false, authenticated };
       return false;
     },
@@ -44,7 +46,9 @@ test.each([[false, 1], [true, 0]])("login-only confirms authentication and leave
     expect(clicked).toEqual(['input[type="submit"][value="LOGIN"]']);
     expect(destinations.every(destination => !/Wizard|Create|Submit|Payment/.test(destination))).toBe(true);
     expect(maximize).toHaveBeenCalledTimes(maximizeCalls);
+    // E4: targeted waits replace home/login ready() calls; NZWH_EARLY_FILL=0 restores them.
+    expect(readyReads).toBe(readyCalls);
     expect(quit).not.toHaveBeenCalled();
     expect(result.driver).toBe(driver);
-  } finally { await rm(directory, { recursive: true, force: true }); }
+  } finally { vi.unstubAllEnvs(); await rm(directory, { recursive: true, force: true }); }
 });

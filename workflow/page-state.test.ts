@@ -34,3 +34,16 @@ test("home stays home without CAPTCHA signals; foreign origin skips DOM", async 
   await expect(classifyPage(foreign.driver, o)).resolves.toBe("other");
   expect(foreign.executeScript).not.toHaveBeenCalled();
 });
+import { buildPageProbeScript, parsePageProbe } from "./page-state";
+test("page probe: parser accepts only well-formed answers", () => {
+  const auth = { loginForm: false, rejected: false, authenticated: true };
+  expect(parsePageProbe({ nzwhProbe: 1, site: false, captcha: false, auth })).toEqual({ site: false, captcha: false, auth });
+  expect(parsePageProbe({ nzwhProbe: 1, site: "busy", captcha: true, auth })).toMatchObject({ site: "busy", captcha: true });
+  for (const bad of [null, false, "complete", [], { loginForm: false }, { nzwhProbe: 1, site: "x", captcha: false, auth }, { nzwhProbe: 1, site: false, captcha: 1, auth }, { nzwhProbe: 1, site: false, captcha: false }])
+    expect(parsePageProbe(bad)).toBeNull();
+});
+test("page probe: one script wraps the three existing scripts", () => {
+  const script = buildPageProbeScript({ site: "return 'denied';", captcha: "return true;", auth: "return {a:1};" });
+  expect(script).toContain("(function () {return 'denied';})()");
+  expect(script).toContain("nzwhProbe: 1");
+});

@@ -517,3 +517,37 @@ test("E5: authoritative pass identical to the early pass runs one settle barrier
   await runEarly(differing);
   expect(differing.log.filter((l) => l === "settle").length).toBe(settleReads * 2);
 });
+test("off trace: SAVE, then reload, then batched readback; possible/accepted/verified in order", async () => {
+  const f = fake();
+  await run(f);
+  expect(f.log.filter((l) => ["save", "navigate"].includes(l))).toEqual(["save", "navigate"]);
+  const order = ["event:possible", "save", "event:accepted", "navigate", "event:verified"].map((l) => f.log.indexOf(l));
+  expect(order.every((position) => position >= 0)).toBe(true);
+  expect([...order].sort((a, b) => a - b)).toEqual(order);
+  expect(count(f, "nzwh:read-values")).toBe(2);
+});
+const preSave = (f: Fake, answer: unknown) => {
+  const base = f.driver.executeScript.bind(f.driver) as (script: string, ...args: unknown[]) => Promise<unknown>;
+  (f.driver as unknown as { executeScript: unknown }).executeScript = async (script: string, ...args: unknown[]) =>
+    script.includes("nzwhPreSave") ? (f.scripts.push(script), answer) : base(script, ...args);
+};
+test("E6 combined pre-SAVE answer: unmapped fields stop before SAVE", async () => {
+  const f = fake();
+  preSave(f, { nzwhPreSave: 1, unmapped: ["ContentPlaceHolder1_extra"], href: URL_, saveId: SAVE_ID });
+  await expect(run(f)).rejects.toThrow("Additional identification branch fields need mapping before SAVE: ContentPlaceHolder1_extra.");
+  expect(f.log).not.toContain("save");
+});
+test("E6 combined pre-SAVE answer: a changed URL stops before SAVE", async () => {
+  const f = fake();
+  preSave(f, { nzwhPreSave: 1, unmapped: [], href: "https://onlineservices.immigration.govt.nz/other", saveId: SAVE_ID });
+  await expect(run(f)).rejects.toThrow("Unexpected navigation before SAVE.");
+  expect(f.log).not.toContain("save");
+});
+test("E6 combined pre-SAVE answer: the chosen SAVE id is used directly; no id falls back to the footer lookup", async () => {
+  for (const saveId of [SAVE_ID, null]) {
+    const f = fake();
+    preSave(f, { nzwhPreSave: 1, unmapped: [], href: URL_, saveId });
+    await run(f);
+    expect(f.log.filter((l) => l === "save")).toHaveLength(1);
+  }
+});
