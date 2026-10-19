@@ -1,10 +1,8 @@
 {
   "verdict": "APPROVED",
   "findings": [
-    "Run total baseline (likely): runStartMs set at module load, only reset in fillAndSaveWorkingHolidaySection; reset at start of executeWorkingHoliday.",
-    "Residual log noise (confirmed): occupation lookup chatter still stamped; wrap in quiet token if desired.",
-    "No visual verification (confirmed): test:browser failed early on unrelated step; manually check new layout.",
-    "Literal [NZWH:q] token in run.ts while quiet() is unused (cosmetic)."
+    "Non-blocking (possible): GET of section N in the verify tab after N+1 loads in the main tab might alter server-side wizard step state; verify live with the flag on.",
+    "Non-blocking (confirmed): captchaLocks cannot contend under serialized awaits; harmless, but would deadlock if captchaGuard became reentrant."
   ],
-  "reviewDoc": "/Users/MAC/Desktop/DEV/nz-working-holiday-automation/.agents/tasks/logs-timing-review.md"
+  "reviewDoc": "/Users/MAC/Desktop/DEV/nz-working-holiday-automation/.agents/tasks/review.md"
 }
