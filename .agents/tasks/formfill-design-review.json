@@ -1,0 +1,9 @@
+{
+  "verdict": "CHANGES_REQUESTED",
+  "findings": [
+    {"id": 1, "severity": "MEDIUM", "title": "Pipeline-mode DOM-ready 'accepted' turns late [errorlabel] failures into saved_unverified, and barrier 'accepted' lets N+1 SAVE before N's load-time validation", "fix": "Emit persistence 'accepted' only after the load-time re-scan passes (internal phase 'domready' at DOM-ready); barrier 'accepted' waits for that event; add a test that the item status is failed and N+1 gets no SAVE"},
+    {"id": 2, "severity": "NIT", "title": "Barrier 'accepted': the wait for slot A to be done before N+2 has no named call site", "fix": "Run awaitBarrier(slotA,'done') after N+1's DOM-ready acceptance and before N+2's boundary()"},
+    {"id": 3, "severity": "NIT", "title": "X5 maximize-skip condition omits the driver-launched path, which also sets --window-size", "fix": "Define the flag as 'window sized at launch (not attach mode)'"}
+  ],
+  "reviewDoc": "/Users/MAC/Desktop/DEV/nz-working-holiday-automation/.worktrees/formfill-speedup/.agents/tasks/formfill-design-review.md"
+}
