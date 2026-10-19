@@ -3,6 +3,7 @@ import { expect, test, vi } from "vitest";
 import type { WebDriver } from "selenium-webdriver";
 import { StopRequested } from "../lib/execution-controller";
 import { finishApplication, readSubmissionPage } from "./submission";
+import { AccessDeniedError } from "./site-busy";
 
 const origin = "https://onlineservices.immigration.govt.nz";
 const applicationId = "fixture-123";
@@ -219,4 +220,30 @@ test("selects all declarations in one batch and logs count", async () => {
   expect(clicks.slice(0, 3)).toEqual(["I agree", "I understand", "I confirm"]);
   expect(log.mock.calls.some(call => /Declarations: selected 3\/3 Yes in one batch/.test(String(call[0])))).toBe(true);
   log.mockRestore();
+});
+
+const deniedPage = "https://www.immigration.govt.nz/formshelp/access-denied";
+test("an access-denied redirect after the final Submit click is incomplete and never clicks again", async () => {
+  const { driver, options, clicks } = fixture([{ url: path("Application/Submit.aspx"), button: "Submit" }, { url: deniedPage }]);
+  const result = await finishApplication(driver, options);
+  expect(result).toMatchObject({ success: false, outcome: "incomplete" });
+  expect(clicks).toEqual(["finalSubmit"]);
+  expect(options.submitting).toHaveBeenCalledOnce();
+  expect(options.confirmed).not.toHaveBeenCalled();
+});
+test("an access-denied guard error while waiting after a click is incomplete, with no second click", async () => {
+  const { driver, options, clicks } = fixture([{ url: path("Application/Submit.aspx"), button: "Submit" }]);
+  options.waitForChange.mockRejectedValue(new AccessDeniedError());
+  const result = await finishApplication(driver, options);
+  expect(result).toMatchObject({ success: false, outcome: "incomplete" });
+  expect(result.message).toContain("Không tự nộp lại");
+  expect(clicks).toEqual(["finalSubmit"]);
+  expect(options.confirmed).not.toHaveBeenCalled();
+});
+test("an access-denied error from the page-ready check before any click ends incomplete without clicking", async () => {
+  const { driver, options, clicks } = fixture([{ url: path("Application/Submit.aspx"), button: "Submit" }]);
+  options.ready.mockRejectedValue(new AccessDeniedError());
+  expect(await finishApplication(driver, options)).toMatchObject({ success: false, outcome: "incomplete" });
+  expect(clicks).toEqual([]);
+  expect(options.submitting).not.toHaveBeenCalled();
 });

@@ -53,7 +53,7 @@ function stopSpawned(child?: ChildProcess): void {
 
 export type BrowserType = "visible" | "headless" | "profile" | "profile-headless";
 /** Node-only browser selection. Selenium Manager resolves a matching driver unless overridden. */
-export async function chooseBrowser(type: BrowserType, useDefaultAgent = true, profileName = "working-holiday", attachPort?: number, signal?: AbortSignal): Promise<WebDriver> {
+export async function chooseBrowser(type: BrowserType, useDefaultAgent = true, profileName = "working-holiday", attachPort?: number, signal?: AbortSignal, pageLoadStrategy: "normal" | "eager" = "normal"): Promise<WebDriver> {
   if (typeof window !== "undefined") throw new Error("Browser automation requires the local Node server.");
   if (signal?.aborted) throw abortError();
   let spawned: ChildProcess | undefined;
@@ -93,6 +93,8 @@ export async function chooseBrowser(type: BrowserType, useDefaultAgent = true, p
       if (!useDefaultAgent) options.addArguments(USER_AGENT);
     }
   }
+  // "eager" returns from navigation at DOMContentLoaded; callers restore load waits where they matter.
+  options.setPageLoadStrategy(pageLoadStrategy);
   const builder = new Builder().forBrowser("chrome").setChromeOptions(options);
   if (process.env.NZWH_CHROMEDRIVER) builder.setChromeService(new ServiceBuilder(process.env.NZWH_CHROMEDRIVER));
   try {

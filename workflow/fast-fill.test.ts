@@ -3,8 +3,8 @@ import { runInNewContext } from "node:vm";
 import { error as webdriverError } from "selenium-webdriver";
 import { readFileSync } from "node:fs";
 import {
-  REMOTE_TRIGGER_FN, addFilled, buildFillSegmentScript, fastFillEnabled, isDisplayedAtomSource, isNavigationError,
-  normalizeLabel, planSection, type FillEntry, type SegmentResult,
+  REMOTE_TRIGGER_FN, SECTION_DOM_READY_JS, addFilled, buildFillSegmentScript, buildWaitForFieldScript, earlyFillEnabled,
+  fastFillEnabled, isDisplayedAtomSource, isNavigationError, normalizeLabel, planSection, type FillEntry, type SegmentResult,
 } from "./fast-fill";
 import { steps } from "./fields";
 import { applicable } from "./conditions";
@@ -78,10 +78,11 @@ function dom(...specs: (FakeOptions & { tag: "input" | "textarea" | "select" })[
     });
     return chosen;
   };
-  const context = { document, performance: { timeOrigin: 42 }, Event, FocusEvent, HTMLInputElement, HTMLTextAreaElement, HTMLSelectElement, Array, Object, String };
-  const run = (entries: FillEntry[], start = 0): SegmentResult =>
-    runInNewContext(`(function () { ${buildFillSegmentScript("function (e) { return e.__shown !== false; }")} }).apply(null, args)`, { ...context, args: [entries, start] });
-  return { run, element: (id: string) => elements.get(id)!, select2 };
+  const window: { addEventListener: () => void; __nzwhEarly?: Record<string, string> } = { addEventListener: () => undefined };
+  const context = { window, document, performance: { timeOrigin: 42 }, Event, FocusEvent, HTMLInputElement, HTMLTextAreaElement, HTMLSelectElement, Array, Object, String };
+  const run = (entries: FillEntry[], start = 0, deferClears = false, restoreEarly = false): SegmentResult =>
+    runInNewContext(`(function () { ${buildFillSegmentScript("function (e) { return e.__shown !== false; }")} }).apply(null, args)`, { ...context, args: [entries, start, deferClears, restoreEarly] });
+  return { run, element: (id: string) => elements.get(id)!, select2, window };
 }
 const entry = (key: string, kind: FillEntry["kind"], expected: string, applicableField = true): FillEntry =>
   ({ key, id: key, kind, expected, applicable: applicableField, colonsPrepared: false });
@@ -250,4 +251,122 @@ test("conditional controllers precede their dependents (segment yield ordering)"
   const data = sample();
   data.personal.representedByAdviser = "No";
   for (const key of Object.keys(steps.adviser.fields)) expect(applicable(data, "adviser", key)).toBe(false);
+});
+
+// --- Phase 2: early fill ------------------------------------------------------------------------
+test.each([[undefined, true], ["1", true], ["0", false], ["false", false], [" False ", false]])(
+  "NZWH_EARLY_FILL=%s → %s", (value, expected) => {
+    if (value !== undefined) vi.stubEnv("NZWH_EARLY_FILL", value);
+    else delete process.env.NZWH_EARLY_FILL;
+    expect(earlyFillEnabled()).toBe(expected);
+  });
+test("SECTION_DOM_READY_JS waits for interactive DOM, jQuery ready/idle, no async postback and the field", () => {
+  const ready = (o: { state?: string; field?: boolean; jQuery?: unknown; async?: boolean }) => {
+    const document = {
+      readyState: o.state ?? "interactive",
+      querySelectorAll: () => [{ sheet: {} }],
+      getElementById: () => (o.field === false ? null : {}),
+    };
+    const ctx: Record<string, unknown> = { window: { addEventListener: () => undefined }, document, Array, args: ["f"] };
+    if (o.jQuery !== undefined) ctx.jQuery = o.jQuery;
+    if (o.async !== undefined) ctx.Sys = { WebForms: { PageRequestManager: { getInstance: () => ({ get_isInAsyncPostBack: () => o.async }) } } };
+    return runInNewContext(`(function () { ${SECTION_DOM_READY_JS} }).apply(null, args)`, ctx);
+  };
+  expect(ready({})).toBe(true);
+  expect(ready({ state: "loading" })).toBe(false);
+  expect(ready({ field: false })).toBe(false);
+  expect(ready({ async: true })).toBe(false);
+  expect(ready({ async: false })).toBe(true);
+  expect(ready({ jQuery: { active: 0, isReady: false } })).toBe(false);
+  expect(ready({ jQuery: { active: 1, isReady: true } })).toBe(false);
+  expect(ready({ jQuery: { active: 0, isReady: true } })).toBe(true);
+});
+test("deferClears records the original pre-write value once, defers clears and never returns it", () => {
+  const page = dom({ tag: "input", id: "a", value: "SENTINEL-ORIG" }, { tag: "input", id: "c", value: "keep" },
+    { tag: "select", id: "p", value: "No", onchange: "__doPostBack('p','')", options: [{ value: "No", label: "No" }, { value: "Yes", label: "Yes" }] });
+  const first = page.run([entry("a", "text", "SENTINEL-NEW"), entry("c", "text", ""), entry("p", "select", "Yes")], 0, true);
+  expect(first.results).toEqual([{ key: "a", status: "filled" }, { key: "c", status: "deferred" }]);
+  expect(first.stop).toEqual({ index: 2, reason: "posting" });
+  expect((page.element("c") as unknown as { value: string }).value).toBe("keep");
+  expect((page.element("p") as unknown as { value: string }).value).toBe("No");
+  expect(page.window.__nzwhEarly).toEqual({ a: "SENTINEL-ORIG" });
+  (page.element("a") as unknown as { value: string }).value = "other";
+  page.run([entry("a", "text", "SENTINEL-NEW")], 0, true);
+  expect(page.window.__nzwhEarly).toEqual({ a: "SENTINEL-ORIG" });
+  expect(JSON.stringify(first)).not.toMatch(/SENTINEL|__nzwhEarly/);
+});
+test("restoreEarly replays early writes silently, then re-decides with events on the settled DOM", () => {
+  const page = dom({ tag: "input", id: "a", value: "orig" });
+  page.run([entry("a", "text", "new")], 0, true);
+  const a = page.element("a") as unknown as { events: string[]; value: string };
+  a.events = [];
+  const out = page.run([entry("a", "text", "new")], 0, false, true);
+  expect(out.results).toEqual([{ key: "a", status: "filled" }]);
+  expect(a.events).toEqual(blurSequence); // only the re-write's events; the restore fired none
+  expect(page.window.__nzwhEarly).toEqual({});
+});
+test("restoreEarly: a now-posting field stops; a now-hidden optional field keeps its pre-early value", () => {
+  const page = dom({ tag: "select", id: "p", value: "No", options: [{ value: "No", label: "No" }, { value: "Yes", label: "Yes" }] },
+    { tag: "input", id: "h", value: "orig" });
+  page.run([entry("p", "select", "Yes")], 0, true);
+  page.run([entry("h", "text", "")], 0, true); // cleared later fields are deferred, so write a value instead
+  page.run([entry("h", "text", "early")], 0, true);
+  const p = page.element("p") as unknown as { attributes: { name: string; value: string }[]; events: string[]; value: string };
+  p.attributes = [{ name: "onchange", value: "__doPostBack('p','')" }];
+  p.events = [];
+  const posting = page.run([entry("p", "select", "Yes")], 0, false, true);
+  expect(posting.stop).toEqual({ index: 0, reason: "posting" });
+  expect(p.value).toBe("No");
+  expect(p.events).toEqual([]);
+  const h = page.element("h") as unknown as { __shown: boolean; value: string; events: string[] };
+  h.__shown = false;
+  // Swept at start 0 above already; record gone, value restored.
+  expect(h.value).toBe("orig");
+  const hidden = page.run([entry("h", "text", "")], 0, false, true);
+  expect(hidden.results).toEqual([{ key: "h", status: "skipped-unavailable" }]);
+  expect(h.value).toBe("orig");
+});
+test("restoreEarly sweep at start 0 restores every record before a posting stop; no sweep for start > 0", () => {
+  const page = dom({ tag: "select", id: "b", value: "No", options: [{ value: "No", label: "No" }, { value: "Yes", label: "Yes" }] },
+    { tag: "input", id: "x" }, { tag: "input", id: "a", value: "a0" });
+  page.window.__nzwhEarly = { a: "a0" };
+  (page.element("a") as unknown as { value: string }).value = "early";
+  const b = page.element("b") as unknown as { attributes: { name: string; value: string }[] };
+  b.attributes = [{ name: "onchange", value: "__doPostBack('b','')" }];
+  const a = page.element("a") as unknown as { value: string; events: string[] };
+  const entries = [entry("b", "select", "Yes"), entry("x", "text", ""), entry("a", "text", "early")];
+  const later = page.run(entries, 1, false, true);
+  expect(later.results).toEqual([{ key: "x", status: "unchanged" }, { key: "a", status: "filled" }]); // per-entry fallback restore
+  page.window.__nzwhEarly = { a: "a0" };
+  a.value = "early"; a.events = [];
+  const out = page.run(entries, 0, false, true);
+  expect(out.stop).toEqual({ index: 0, reason: "posting" });
+  expect(a.value).toBe("a0");
+  expect(a.events).toEqual([]);
+  expect(page.window.__nzwhEarly).toEqual({});
+});
+test("wait-field script: ready on insertion, loaded at load, pending after the slice", async () => {
+  const harness = (untilLoad: boolean) => {
+    let present = false, state = "interactive";
+    const observers: (() => void)[] = [];
+    const stateListeners: (() => void)[] = [];
+    const document = {
+      get readyState() { return state; },
+      documentElement: {},
+      getElementById: () => (present ? { matches: () => false, tagName: "INPUT" } : null),
+      addEventListener: (_: string, l: () => void) => stateListeners.push(l),
+      removeEventListener: () => undefined,
+    };
+    class MutationObserver { constructor(cb: () => void) { observers.push(cb); } observe() {} disconnect() {} }
+    const result = new Promise<string>((resolve) => runInNewContext(
+      `(function () { ${buildWaitForFieldScript("function () { return true; }")} }).apply(null, args)`,
+      { document, MutationObserver, setTimeout, clearTimeout, args: ["f", "present", 50, untilLoad, resolve] }));
+    return { result, insert: () => { present = true; observers.forEach((o) => o()); }, load: () => { state = "complete"; stateListeners.forEach((l) => l()); } };
+  };
+  const a = harness(true); a.insert();
+  expect(await a.result).toBe("ready");
+  const b = harness(true); b.load();
+  expect(await b.result).toBe("loaded");
+  const c = harness(false); c.load();
+  expect(await c.result).toBe("pending");
 });

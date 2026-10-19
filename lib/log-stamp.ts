@@ -1,5 +1,5 @@
 import { format } from "node:util";
-import { formatDuration } from "./format-duration";
+import { formatClock } from "./format-duration";
 import { redactSecrets } from "./redact";
 
 // Process-memory only; covers keys loaded/replaced during worker/CLI execution.
@@ -22,10 +22,9 @@ export function installLogStamping(
     (...args: unknown[]) => {
       const text = redactSecrets(format(...args), [...secrets(), ...registeredSecrets], true);
       if (level === "INFO" && text.includes(QUIET_TOKEN)) {
-        for (const line of text.split("\n")) write(`  ${line.replace(QUIET_TOKEN + " ", "")}`);
-        return;
+        return; // routine per-field chatter is dropped; milestones stay stamped
       }
-      const stamp = `${new Date().toISOString()} +${formatDuration(Date.now() - bootMs)} ${level}`;
+      const stamp = `${new Date().toISOString()} +${formatClock(Date.now() - bootMs)} ${level}`;
       for (const line of text.split("\n")) write(`${stamp} ${line}`);
     };
   const log = console.log.bind(console);

@@ -1,0 +1,48 @@
+{
+  "verdict": "CHANGES_REQUESTED",
+  "findings": [
+    {
+      "id": 1,
+      "severity": "HIGH",
+      "title": "Early-pass events dispatched before page handlers bind are lost; authoritative pass treats the field as unchanged and never replays them",
+      "location": "B5 orchestration (unchanged status), B6, B12",
+      "fix": "Record pre-write values in-page (window.__nzwhEarly) during the early pass; in the authoritative pass restore them without events (restoreEarly arg) so every early-written field is re-decided and re-written on the settled DOM (posting -> legacy). Add jQuery.isReady to SECTION_DOM_READY_JS. Fixtures for onload-bound show/hide and onload-bound __doPostBack; B12 row."
+    },
+    {
+      "id": 2,
+      "severity": "HIGH",
+      "title": "Documents reached via a postback inside the authoritative pass are decided at DOMContentLoaded",
+      "location": "B5 runPass 'posting'|'fallback' branch, steps (3)-(4); B6",
+      "fix": "When legacyFillField changes timeOrigin in the authoritative pass, return 'postback'; outer loop settles and restarts the authoritative pass (bounded by entries.length, not counted as unexpected reload). Update B11; fixtures for onload-shown clear and onload reset on a postback response page."
+    },
+    {
+      "id": 3,
+      "severity": "MEDIUM",
+      "title": "Early pass sends server postbacks before the first document's load handlers run",
+      "location": "B5 runPass early 'posting' branch, B6, B11, B12",
+      "fix": "In the early pass a 'posting' stop ends the pass; posting fields are handled only by the authoritative pass on the settled DOM. Update B11; fixture asserting a load-set hidden input reaches the server."
+    },
+    {
+      "id": 4,
+      "severity": "MEDIUM",
+      "title": "Resume guard throws in the early pass, contradicting 'early missing/unavailable-required is never fatal'",
+      "location": "B5 pseudocode vs rationale bullets and B9",
+      "fix": "In the early pass, exceeding MAX_FIELD_RESUMES defers (index = i + 1); only the authoritative pass throws. Unit test."
+    },
+    {
+      "id": 5,
+      "severity": "NIT",
+      "title": "REMOTE_TRIGGER regex escaping changes when moved into a String.raw constant",
+      "location": "B5 REMOTE_TRIGGER",
+      "fix": "Use single backslashes in String.raw; vm-evaluated unit test covering __doPostBack, WebForm_DoPostBack, form.submit(), fetch(, XMLHttpRequest, sendBeacon."
+    },
+    {
+      "id": 6,
+      "severity": "NIT",
+      "title": "CAPTCHA load wait can be silent up to 30 s and ignores a disappearing challenge",
+      "location": "B8 provider-branch load wait",
+      "fix": "Keep readyState read first per iteration; then break when !captchaPending(driver). Add a captcha-load-wait test."
+    }
+  ],
+  "reviewDoc": "/Users/MAC/Desktop/DEV/nz-working-holiday-automation/.agents/tasks/design-review.md"
+}

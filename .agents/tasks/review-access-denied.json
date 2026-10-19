@@ -1,0 +1,8 @@
+{
+  "verdict": "APPROVED",
+  "findings": [
+    "Non-blocking: Pay Now, Secure Payment and payer OK have no dedicated access-denied tests; they share the finishApplication loop exercised by the final-Submit cases.",
+    "Non-blocking (documented): a redirect still in flight when unexpectedReload checks reads the old document and falls back to 'possible' and stop, which is the conservative direction."
+  ],
+  "reviewDoc": "/Users/MAC/Desktop/DEV/nz-working-holiday-automation/.agents/tasks/review-access-denied.md"
+}
