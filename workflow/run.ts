@@ -33,7 +33,8 @@ import { classifyPage, type PageState } from "./page-state";
 import { loadCapSolverKey } from "../server/cloud";
 import { solveRecaptchaV2 as solveTwoCaptcha, TwoCaptchaError, formatDuration } from "./two-captcha";
 import { quiet } from "../lib/log-stamp";
-import { loadTwoCaptchaKey } from "../server/cloud";
+import { solveAutoCaptcha, AutoCaptchaError } from "./autocaptcha";
+import { loadTwoCaptchaKey, loadAutoCaptchaKey } from "../server/cloud";
 import { solveRecaptchaV2, CapSolverError } from "./capsolver";
 import { readCaptchaChallenge, applyCaptchaToken, clearCaptchaToken, type CaptchaChallenge } from "./capsolver-browser";
 import { finishApplication, type ApplicationResult } from "./submission";
@@ -68,7 +69,7 @@ const reportDirectory = process.env.NZWH_REPORT_DIR ?? directory;
 const execution = new AsyncLocalStorage<{
   hooks?: ExecutionHooks;
   risk: boolean;
-  captchaMode?: "manual" | "capsolver" | "2captcha";
+  captchaMode?: "manual" | "capsolver" | "2captcha" | "autocaptcha";
   loadCapSolverKey?: (signal?: AbortSignal) => Promise<string | null>;
   signal?: AbortSignal;
   credentials?: { username: string; password: string };
@@ -89,7 +90,7 @@ async function emit(event: ExecutionEvent): Promise<void> {
   await context?.hooks?.event(event);
 }
 /** Test only: run fn with execution hooks so emitted events can be observed. */
-export function withHooksForTest<T>(hooks: ExecutionHooks, fn: () => Promise<T>, options: { captchaMode?: "manual" | "capsolver" | "2captcha"; signal?: AbortSignal; loadCapSolverKey?: (signal?: AbortSignal) => Promise<string | null> } = {}): Promise<T> {
+export function withHooksForTest<T>(hooks: ExecutionHooks, fn: () => Promise<T>, options: { captchaMode?: "manual" | "capsolver" | "2captcha" | "autocaptcha"; signal?: AbortSignal; loadCapSolverKey?: (signal?: AbortSignal) => Promise<string | null> } = {}): Promise<T> {
   return execution.run({ hooks, risk: false, ...options }, fn);
 }
 async function checkpoint(): Promise<void> {
@@ -119,7 +120,7 @@ export interface WorkingHolidayOptions {
   taskKeys?: string[];
   hooks?: ExecutionHooks;
   signal?: AbortSignal;
-  captchaMode?: "manual" | "capsolver" | "2captcha";
+  captchaMode?: "manual" | "capsolver" | "2captcha" | "autocaptcha";
   attachPort?: number;
   scenario?: string;
   allowFictionalDraftSave?: boolean;
@@ -192,7 +193,7 @@ export async function captchaGuard(driver: WebDriver): Promise<boolean> {
   const captchaStartedAt = Date.now();
   const since = () => formatDuration(Date.now() - captchaStartedAt);
   const trace = (message: string) => console.log(`[NZWH] CAPTCHA +${since()}: ${message}`);
-  const providerName = context?.captchaMode === "2captcha" ? "2Captcha" : "CapSolver";
+  const providerName = ({ capsolver: "CapSolver", "2captcha": "2Captcha", autocaptcha: "AutoCaptcha" } as const)[context?.captchaMode as "capsolver" | "2captcha" | "autocaptcha"] ?? "CapSolver";
   const manual = "Giải CAPTCHA trong Chrome; tác vụ tự tiếp tục. Chỉ nút Submit riêng của CAPTCHA được tự bấm khi có phản hồi.";
   if (typeof (driver as Driver).sendDevToolsCommand === "function")
     await activateChrome(driver).catch(() => undefined);
@@ -206,7 +207,7 @@ export async function captchaGuard(driver: WebDriver): Promise<boolean> {
   let completed = false;
   let solvedAt: number | undefined;
   try {
-    if (context?.captchaMode === "capsolver" || context?.captchaMode === "2captcha") {
+    if (context?.captchaMode === "capsolver" || context?.captchaMode === "2captcha" || context?.captchaMode === "autocaptcha") {
       let skipProvider = false;
       if (eagerDrivers.has(driver)) {
         // Eager no longer guarantees load; the challenge iframe may not exist yet. Normally just the load tail.
@@ -230,7 +231,7 @@ export async function captchaGuard(driver: WebDriver): Promise<boolean> {
         if (challenge) {
           await notify(`Đang đọc cấu hình ${providerName}; bạn vẫn có thể giải CAPTCHA trong Chrome.`);
           try {
-            key = await (context.captchaMode === "2captcha" ? loadTwoCaptchaKey : context.loadCapSolverKey ?? loadCapSolverKey)(signal);
+            key = await (context.captchaMode === "autocaptcha" ? loadAutoCaptchaKey : context.captchaMode === "2captcha" ? loadTwoCaptchaKey : context.loadCapSolverKey ?? loadCapSolverKey)(signal);
           } catch {
             checkCancelled();
             configurationUnavailable = true;
@@ -241,10 +242,10 @@ export async function captchaGuard(driver: WebDriver): Promise<boolean> {
         if (key && challenge) {
           await notify(`Đang thử ${providerName} (reCAPTCHA v2). Bạn vẫn có thể giải trong Chrome; lỗi sẽ chuyển sang thủ công.`);
           const request = { websiteURL: challenge.websiteURL, websiteKey: challenge.websiteKey };
-          pending = (context.captchaMode === "2captcha" ? solveTwoCaptcha(request, key, signal, trace) : solveRecaptchaV2(request, key, signal))
+          pending = (context.captchaMode === "autocaptcha" ? solveAutoCaptcha(request, key, signal, trace) : context.captchaMode === "2captcha" ? solveTwoCaptcha(request, key, signal, trace) : solveRecaptchaV2(request, key, signal))
             .then(token => { result = { token }; solvedAt = Date.now(); trace(`${providerName} ready; token length ${token.length}.`); }, error => { result = { error }; });
         } else {
-          await notify(`${!challenge ? "Chưa hỗ trợ cấu hình CAPTCHA này." : configurationUnavailable ? `Không đọc được cấu hình ${providerName}; nhờ quản trị viên kiểm tra.` : context.captchaMode === "2captcha" ? "Chưa có khóa 2Captcha dùng chung; nhờ quản trị viên cấu hình trong /admin/2captcha." : "Chưa có khóa CapSolver dùng chung; nhờ quản trị viên cấu hình trong /admin."} ${manual}`);
+          await notify(`${!challenge ? "Chưa hỗ trợ cấu hình CAPTCHA này." : configurationUnavailable ? `Không đọc được cấu hình ${providerName}; nhờ quản trị viên kiểm tra.` : context.captchaMode === "autocaptcha" ? "Chưa có khóa AutoCaptcha dùng chung; nhờ quản trị viên cấu hình trong /admin/autocaptcha." : context.captchaMode === "2captcha" ? "Chưa có khóa 2Captcha dùng chung; nhờ quản trị viên cấu hình trong /admin/2captcha." : "Chưa có khóa CapSolver dùng chung; nhờ quản trị viên cấu hình trong /admin."} ${manual}`);
         }
       }
     } else await notify(manual);
@@ -290,7 +291,7 @@ export async function captchaGuard(driver: WebDriver): Promise<boolean> {
             }
           } else {
             attempt.abort();
-            const reason = "error" in resolved && (resolved.error instanceof CapSolverError || resolved.error instanceof TwoCaptchaError) ? resolved.error.category : "service";
+            const reason = "error" in resolved && (resolved.error instanceof CapSolverError || resolved.error instanceof TwoCaptchaError || resolved.error instanceof AutoCaptchaError) ? resolved.error.category : "service";
             const hints: Record<string, string> = {
               balance: "Tài khoản hết số dư.",
               auth: "API key không hợp lệ hoặc bị khóa.",

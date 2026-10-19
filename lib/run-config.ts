@@ -42,7 +42,7 @@ export const runSchema = z
       .string()
       .regex(/^[a-zA-Z0-9_-]{1,60}$/)
       .default("working-holiday"),
-    captchaMode: z.enum(["manual", "capsolver", "2captcha"]).default("manual"),
+    captchaMode: z.enum(["manual", "capsolver", "2captcha", "autocaptcha"]).default("manual"),
     useDefaultAgent: z.boolean().default(true),
     country: z.enum(countryCodes).optional(),
     liveSaveConsent: z.boolean().default(false),

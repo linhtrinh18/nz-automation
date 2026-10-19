@@ -6,7 +6,7 @@ export type CredentialBinding = { userId: string; revision: string };
 export class DocumentError extends Error { constructor(message: string, public status = 400) { super(message); } }
 export class CredentialError extends Error {}
 export const bindingSchema = z.object({ userId: z.string().min(1), revision: z.string().uuid() }).strict();
-const statusSchema = z.object({ userId: z.string().min(1), binding: bindingSchema.nullable(), credentialsConfigured: z.boolean(), capsolverConfigured: z.boolean(), capsolverAvailable: z.boolean(), twoCaptchaConfigured: z.boolean(), twoCaptchaAvailable: z.boolean(), applicationId: z.string() });
+const statusSchema = z.object({ userId: z.string().min(1), binding: bindingSchema.nullable(), credentialsConfigured: z.boolean(), capsolverConfigured: z.boolean(), capsolverAvailable: z.boolean(), twoCaptchaConfigured: z.boolean(), twoCaptchaAvailable: z.boolean(), autocaptchaConfigured: z.boolean().default(false), autocaptchaAvailable: z.boolean().default(false), applicationId: z.string() });
 type Context = { authorization: string; appOrigin: string; binding?: CredentialBinding; applicationId?: string };
 export const cloudContext = new AsyncLocalStorage<Context>();
 let workerContext: Context | undefined;
@@ -55,7 +55,7 @@ export async function loadDocumentForRun(userId: string, documentId: string, rev
   const document = await result("document", { binding, input: { data: blankApplication(), source: { kind: "document", documentId, revision } } });
   return z.object({ id: z.string().uuid(), revision: z.string().uuid(), name: z.string(), data: (await import("../workflow/application-data")).applicationDataSchema }).parse(document);
 }
-export async function loadCapSolverKey(signal?: AbortSignal, provider: "capsolver" | "twoCaptcha" = "capsolver"): Promise<string | null> {
+export async function loadCapSolverKey(signal?: AbortSignal, provider: "capsolver" | "twoCaptcha" | "autoCaptcha" = "capsolver"): Promise<string | null> {
   const binding = context().binding;
   if (!binding) throw new CredentialError("Missing credential binding.");
   const key = z.string().min(1).nullable().parse(await result("provider", { binding, provider }, signal));
@@ -63,3 +63,4 @@ export async function loadCapSolverKey(signal?: AbortSignal, provider: "capsolve
   return key;
 }
 export function loadTwoCaptchaKey(signal?: AbortSignal) { return loadCapSolverKey(signal, "twoCaptcha"); }
+export function loadAutoCaptchaKey(signal?: AbortSignal) { return loadCapSolverKey(signal, "autoCaptcha"); }

@@ -66,6 +66,7 @@ export function buildPlan(input: RunInput): RunPlan {
       "Ghi đè các trường có thể sửa trong các mục đã chọn. Chọn người tư vấn và tra cứu nghề nghiệp cũng có thể gửi dữ liệu lên trang đích.",
       "Đăng xuất phiên cũ, đăng nhập và chọn hồ sơ. Trang đích có thể mở trang mặc định của hồ sơ; chỉ các mục trong phạm vi mới được xử lý. CAPTCHA theo chế độ đã chọn; luôn có thể giải thủ công trong Chrome.",
       ...(input.captchaMode === "capsolver" ? ["CapSolver thử nghiệm: tối đa một lần cho mỗi lần chờ CAPTCHA phù hợp, có tính phí. Chỉ gửi site key và địa chỉ trang CAPTCHA không có tham số; lỗi chuyển sang thủ công. Chưa xác minh trên trang đích thật."] : []),
+      ...(input.captchaMode === "autocaptcha" ? ["AutoCaptcha thử nghiệm: tối đa một lần cho mỗi lần chờ CAPTCHA phù hợp, có tính phí. Chỉ gửi site key và địa chỉ trang CAPTCHA không có tham số; lỗi chuyển sang thủ công. Chưa xác minh trên trang đích thật."] : []),
       ...(input.captchaMode === "2captcha" ? ["2Captcha thử nghiệm: tối đa một lần cho mỗi lần chờ CAPTCHA phù hợp, có tính phí. Chỉ gửi site key và địa chỉ trang CAPTCHA không có tham số; lỗi chuyển sang thủ công. Chưa xác minh trên trang đích thật."] : []),
       input.mode === "fillAndSubmit"
         ? "Điền và nộp: sau khi xác minh các mục đã chọn, thực hiện cam kết và nộp hồ sơ Working Holiday. Lưu bản nháp hoặc gửi CAPTCHA không phải là nộp hồ sơ. Khi chưa có xác nhận đã nộp (kể cả khi chuyển sang thanh toán), lượt chạy chưa hoàn tất."

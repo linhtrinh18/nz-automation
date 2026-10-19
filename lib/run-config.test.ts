@@ -63,8 +63,9 @@ test("login-only does not require valid application values or live-save consent"
 
 test("CAPTCHA provider selection preserves manual default and rejects keys in run input", () => {
   expect(runSchema.parse({ data }).captchaMode).toBe("manual");
-  for (const captchaMode of ["manual", "capsolver", "2captcha"])
+  for (const captchaMode of ["manual", "capsolver", "2captcha", "autocaptcha"])
     expect(runSchema.parse({ data, captchaMode }).captchaMode).toBe(captchaMode);
   expect(runSchema.safeParse({ data, captchaMode: "both" }).success).toBe(false);
   expect(runSchema.safeParse({ data, captchaMode: "2captcha", apiKey: "private" }).success).toBe(false);
+  expect(runSchema.safeParse({ data, captchaMode: "autocaptcha", apiKey: "private" }).success).toBe(false);
 });

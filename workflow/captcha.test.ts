@@ -8,6 +8,7 @@ import { SiteBusyError } from "./site-busy";
 import * as configuration from "../server/cloud";
 import * as provider from "./capsolver";
 import * as twoCaptcha from "./two-captcha";
+import * as autoCaptcha from "./autocaptcha";
 import * as twoConfig from "../server/cloud";
 import * as browser from "./capsolver-browser";
 import { StopRequested } from "../lib/execution-controller";
@@ -351,4 +352,24 @@ test.each(["success", "error", "missing", "unsupported", "database-failure"])("2
   expect(apply).toHaveBeenCalledTimes(kind === "success" ? 1 : 0);
   if (kind !== "success") expect(events.some(e => e.type === "captcha" && e.message?.includes("Giải CAPTCHA trong Chrome"))).toBe(true);
   expect(JSON.stringify(events)).not.toMatch(/two-secret|two-token|private-database-details/);
+});
+
+test.each(["success", "error", "missing", "unsupported", "database-failure"])("AutoCaptcha selection: %s", async kind => {
+  const { solve: capsolver, read, apply, key } = adapters();
+  const lookup = vi.spyOn(twoConfig, "loadAutoCaptchaKey").mockResolvedValue(kind === "missing" ? null : "auto-secret");
+  if (kind === "database-failure") lookup.mockRejectedValue(new Error("private-database-details"));
+  const solve = vi.spyOn(autoCaptcha, "solveAutoCaptcha").mockResolvedValue("auto-token");
+  if (kind === "error") solve.mockRejectedValue(new autoCaptcha.AutoCaptchaError("service"));
+  if (kind === "unsupported") read.mockResolvedValue(null);
+  const events: ExecutionEvent[] = [];
+  await withHooksForTest({ event: async e => { events.push(e); }, checkpoint: async () => {} },
+    () => captchaGuard(fixture([true, true, true, false]).driver), { captchaMode: "autocaptcha" });
+  expect(capsolver).not.toHaveBeenCalled();
+  expect(key).not.toHaveBeenCalled();
+  expect(solve).toHaveBeenCalledTimes(kind === "missing" || kind === "unsupported" || kind === "database-failure" ? 0 : 1);
+  expect(apply).toHaveBeenCalledTimes(kind === "success" ? 1 : 0);
+  if (kind !== "success") expect(events.some(e => e.type === "captcha" && e.message?.includes("Giải CAPTCHA trong Chrome"))).toBe(true);
+  if (kind === "missing") expect(events.some(e => e.type === "captcha" && e.message?.includes("/admin/autocaptcha"))).toBe(true);
+  if (kind !== "unsupported") expect(events.some(e => e.type === "captcha" && e.message?.includes("AutoCaptcha"))).toBe(true);
+  expect(JSON.stringify(events)).not.toMatch(/auto-secret|auto-token|private-database-details/);
 });

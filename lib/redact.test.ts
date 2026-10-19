@@ -9,6 +9,6 @@ test("masks known secrets and key-value patterns", () => {
 });
 
 test("CapSolver credentials are redacted by field name", () => {
-  for (const name of ["clientKey", "apiKey", "api_key", "CAPSOLVER_API_KEY", "TWOCAPTCHA_API_KEY"])
+  for (const name of ["clientKey", "apiKey", "api_key", "CAPSOLVER_API_KEY", "TWOCAPTCHA_API_KEY", "AUTOCAPTCHA_API_KEY"])
     expect(redactSecrets(`${name}=super-secret`, [])).toBe(`${name}=***`);
 });

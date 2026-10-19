@@ -20,7 +20,7 @@ test("local API reviews, launches a real worker, fails closed on revocation and 
     res.setHeader("Content-Type", "application/json");
     if (input.operation === "status") {
       const userId = req.headers.authorization === "Bearer other" ? other : owner;
-      res.end(JSON.stringify({ userId, binding: { userId, revision }, credentialsConfigured: true, capsolverConfigured: false, capsolverAvailable: true, twoCaptchaConfigured: false, twoCaptchaAvailable: true, applicationId: "fixture-target" }));
+      res.end(JSON.stringify({ userId, binding: { userId, revision }, credentialsConfigured: true, capsolverConfigured: false, capsolverAvailable: true, twoCaptchaConfigured: false, twoCaptchaAvailable: true, autocaptchaConfigured: false, autocaptchaAvailable: true, applicationId: "fixture-target" }));
     } else { res.statusCode = 403; res.end(JSON.stringify({ error: "revoked-before-browser" })); }
   });
   await new Promise<void>(resolve => upstream.listen(0, "127.0.0.1", resolve));

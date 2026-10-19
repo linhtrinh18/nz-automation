@@ -315,6 +315,7 @@ export async function startJob(
     // Obsolete provider configuration must not be propagated to workers.
     delete workerEnv.CAPSOLVER_API_KEY;
     delete workerEnv.TWOCAPTCHA_API_KEY;
+    delete workerEnv.AUTOCAPTCHA_API_KEY;
     const child = spawn(
       process.execPath,
       [

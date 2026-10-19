@@ -1,4 +1,4 @@
-const keyValue = /(password|passwd|token|secret|authorization|clientKey|apiKey|api_key|CAPSOLVER_API_KEY|TWOCAPTCHA_API_KEY)(["']?\s*[:=]\s*["']?)[^\s"',;]+/gi;
+const keyValue = /(password|passwd|token|secret|authorization|clientKey|apiKey|api_key|CAPSOLVER_API_KEY|TWOCAPTCHA_API_KEY|AUTOCAPTCHA_API_KEY)(["']?\s*[:=]\s*["']?)[^\s"',;]+/gi;
 /** Masks known secret values and common key=value secret patterns. */
 export function redactSecrets(
   text: string,
